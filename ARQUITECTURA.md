@@ -87,8 +87,10 @@ Todo esto se verificó contra la base de datos real, no es estimación:
 1. **Pool de conexiones y secreto en *module scope***, fuera del handler, para que sobrevivan entre
    invocaciones. Abrir conexión o leer Secrets Manager por request es latencia y costo regalados.
 2. **Concurrencia reservada por función**, para que ninguna pueda saturar 1 vCore sola.
-3. **Cachear los catálogos.** `tblEstados` (61 filas), `tblCampus` (**18**, no 16: los seeds
-   cambiaron desde que se escribió esto), `tblRoles` (14), `tblPerfiles` (5), `tblProgramasVoae` (3)
+3. **Cachear los catálogos.** `tblEstados` (61 filas), `tblCampus` (**18 filas, 17 activas**, no
+   16: los seeds cambiaron. La inactiva se llama "Diondisio" y no es un centro de la UNAH; parece
+   una fila de prueba insertada a mano, conviene borrarla), `tblRoles` (14), `tblPerfiles` (5),
+   `tblProgramasVoae` (3)
    y todos los `tblTipos*` son diminutos y casi estáticos, y prácticamente toda pantalla los pide.
    Sacarlos del camino crítico es la mayor palanca de rendimiento disponible — más que cualquier
    decisión sobre número de funciones.
@@ -140,7 +142,7 @@ función de la que dependen las otras tres, y la dueña del caché de catálogos
 | Endpoint | Qué hace |
 |---|---|
 | `GET /v1/catalogo/estados?contexto=GIRA_SOLICITUD` | Estados filtrados por `contextoEstado`. Alimenta todo selector y badge de estado de la app. Sin el filtro devuelve las 61 filas de los 3 sistemas mezcladas, que no le sirve a nadie. |
-| `GET /v1/catalogo/campus` | Los 18 centros. Usado por los filtros de PROCAD, Voluntariado y Giras. |
+| `GET /v1/catalogo/campus` | Los 17 centros activos (18 filas, una dada de baja). Usado por los filtros de PROCAD, Voluntariado y Giras. |
 | `GET /v1/catalogo/periodos` | Períodos académicos. |
 | `GET /v1/catalogo/periodos/activo` | El período vigente, que casi toda pantalla necesita por defecto. **Ojo:** no hay columna ni trigger que marque cuál es el activo. Se resuelve por rango de fechas (el período activo cuyo rango contiene hoy) con respaldo al más reciente por año y PAC. Es una convención que la implementación tuvo que inventar; conviene que el equipo la valide o que el esquema la haga explícita. |
 | `GET /v1/catalogo/roles` · `GET /v1/catalogo/perfiles` | Catálogo de roles (14) y perfiles (5). |

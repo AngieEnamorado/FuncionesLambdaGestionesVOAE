@@ -21,10 +21,16 @@ DOMINIO="${1:-catalogo}"
 FUNCION="voae-${DOMINIO}"
 ROL="voae-lambda-ejecucion"
 SECRETO="secreto-voae"
-NOMBRE_API="voae-api"
+NOMBRE_API="$FUNCION"   # una API por funcion, con el mismo nombre
 RUNTIME="nodejs22.x"
 MEMORIA_MB=512
-TIMEOUT_S=10
+
+# Los dominios escriben en varias tablas por peticion y aguantan mas que una
+# lectura de catalogo, asi que se les da mas margen.
+case "$DOMINIO" in
+  catalogo) TIMEOUT_S=10 ;;
+  *)        TIMEOUT_S=15 ;;
+esac
 
 aws_() { aws "$@" --profile "$PERFIL" --region "$REGION"; }
 
@@ -127,7 +133,7 @@ if [[ "$id_api" == "None" || -z "$id_api" ]]; then
   id_api="$(aws_ apigatewayv2 create-api \
     --name "$NOMBRE_API" \
     --protocol-type HTTP \
-    --description "API de gestiones VOAE" \
+    --description "API de ${FUNCION}" \
     --cors-configuration 'AllowOrigins=*,AllowMethods=GET,POST,PUT,DELETE,OPTIONS,AllowHeaders=Content-Type,X-Voae-Usuario' \
     --query ApiId --output text)"
   echo "    creada: ${id_api}"

@@ -109,6 +109,51 @@ export async function consultarUna<T = Record<string, unknown>>(
 }
 
 /**
+ * Corre varias escrituras como una sola unidad. El callback recibe un
+ * ejecutor con la misma forma que `consultar`, pero atado a la transaccion.
+ * Si lanza, se revierte todo.
+ */
+export async function enTransaccion<T>(
+  trabajo: (
+    ejecutar: <F = Record<string, unknown>>(
+      consulta: string,
+      parametros?: Record<string, Parametro>,
+    ) => Promise<F[]>,
+  ) => Promise<T>,
+): Promise<T> {
+  const pool = await obtenerPool();
+  const transaccion = new sql.Transaction(pool);
+  await transaccion.begin();
+
+  let confirmada = false;
+  try {
+    const ejecutar = async <F = Record<string, unknown>>(
+      consulta: string,
+      parametros: Record<string, Parametro> = {},
+    ): Promise<F[]> => {
+      const peticion = new sql.Request(transaccion);
+      for (const [nombre, [tipo, valor]] of Object.entries(parametros)) {
+        peticion.input(nombre, tipo, valor);
+      }
+      const resultado = await peticion.query<F>(consulta);
+      return resultado.recordset ?? [];
+    };
+
+    const valor = await trabajo(ejecutar);
+    await transaccion.commit();
+    confirmada = true;
+    return valor;
+  } finally {
+    if (!confirmada) {
+      // El rollback puede fallar si la transaccion ya murio (un trigger que
+      // hace ROLLBACK la aborta por su cuenta). El error que importa es el
+      // original, asi que este se traga.
+      await transaccion.rollback().catch(() => {});
+    }
+  }
+}
+
+/**
  * Llama a un procedimiento almacenado. La generacion de actividades en serie
  * y la activacion de periodo ya viven en procedimientos de Procad: se llaman,
  * no se reimplementan.
