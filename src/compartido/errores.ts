@@ -75,11 +75,16 @@ export function traducirErrorSql(error: unknown): ErrorHttp | null {
     case 2627: // violacion de PRIMARY KEY o UNIQUE
     case 2601: // violacion de indice unico
       return new ErrorHttp(409, "Ya existe un registro con esos datos.");
-    case 547: // violacion de FOREIGN KEY o CHECK
+    case 547: {
+      // violacion de FOREIGN KEY o CHECK. SQL Server nombra la restriccion en el
+      // mensaje; sin ese nombre, un 409 generico obliga a adivinar cual fue.
+      const restriccion = /constraint "([^"]+)"/i.exec(sqlError.message ?? "")?.[1];
       return new ErrorHttp(
         409,
-        "La operacion no cumple una restriccion de la base de datos (referencia inexistente o valor no permitido).",
+        "La operacion no cumple una restriccion de la base de datos (referencia inexistente o valor no permitido)." +
+          (restriccion ? ` Restriccion: ${restriccion}.` : ""),
       );
+    }
     case 515: // insercion de NULL en columna NOT NULL
       return new ErrorHttp(400, "Falta un campo obligatorio.");
     case 245: // conversion fallida
