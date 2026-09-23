@@ -366,6 +366,26 @@ export function listarAccesos(f: {
   `, filtros.parametros);
 }
 
+/**
+ * Otorga o revoca el acceso al panel de una persona, en todos sus grupos a la
+ * vez: el panel pregunta por la persona, no por cada vinculo. Que la persona
+ * tenga el rol DIRECTOR y el perfil que corresponde lo vuelven a comprobar
+ * tgrAccesosValidar y tgrAccesosColaboradorInternoRequierePerfil al actualizar.
+ */
+export async function cambiarAccesoPersona(idPersona: number, activo: boolean) {
+  const vinculos = await consultar<{ total: number }>(
+    "SELECT COUNT(*) AS total FROM Procad.tblAccesos WHERE idPersona = @persona",
+    { persona: [sql.Int, idPersona] },
+  );
+  if (!vinculos[0]?.total) throw noEncontrado(`La persona ${idPersona} no esta vinculada a ningun grupo.`);
+
+  await consultar(
+    "UPDATE Procad.tblAccesos SET estadoAcceso = @activo WHERE idPersona = @persona",
+    { persona: [sql.Int, idPersona], activo: [sql.Bit, activo] },
+  );
+  return listarAccesos({ grupo: null, campus: null, persona: idPersona, incluirInactivos: true });
+}
+
 /** Beneficiarios PROSENE: elegibles automaticos segun Procad.vwElegibilidad. */
 export function listarProsene(incluirInactivos: boolean) {
   return consultar(`

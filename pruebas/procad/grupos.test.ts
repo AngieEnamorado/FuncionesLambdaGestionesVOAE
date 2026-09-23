@@ -204,3 +204,40 @@ describe("Accesos y PROSENE", () => {
     assert.doesNotMatch(llamadaCon(/tblBeneficiariosProsene/).texto, /WHERE/);
   });
 });
+
+describe("PUT /accesos/personas/{id}", () => {
+  test("revoca el acceso en todos los grupos de la persona", async () => {
+    responderPor([
+      [/SELECT COUNT\(\*\) AS total FROM Procad\.tblAccesos/, [{ total: 2 }]],
+      [/FROM Procad\.tblAccesos a/, [{ idAcceso: 1, activo: false }, { idAcceso: 2, activo: false }]],
+    ]);
+    const { codigo, cuerpo } = await invocar(handler, "PUT", "/v1/procad/accesos/personas/20", { activo: false });
+
+    assert.equal(codigo, 200);
+    assert.equal(cuerpo.length, 2);
+    assert.deepEqual(llamadaCon(/UPDATE Procad\.tblAccesos/).parametros, { persona: 20, activo: false });
+  });
+
+  test("una persona sin vinculos es 404", async () => {
+    responderPor([[/SELECT COUNT\(\*\) AS total/, [{ total: 0 }]]]);
+    const { codigo } = await invocar(handler, "PUT", "/v1/procad/accesos/personas/20", { activo: true });
+    assert.equal(codigo, 404);
+  });
+
+  test("sin activo es 400", async () => {
+    const { codigo } = await invocar(handler, "PUT", "/v1/procad/accesos/personas/20", {});
+    assert.equal(codigo, 400);
+    assert.equal(llamadas.length, 0);
+  });
+
+  test("si la persona ya no tiene el rol, el trigger responde 409", async () => {
+    const mensaje = "La persona debe tener el rol PROCAD DIRECTOR para recibir una vista exclusiva.";
+    responderPor([
+      [/SELECT COUNT\(\*\) AS total/, [{ total: 1 }]],
+      [/UPDATE/, () => { throw errorDeTrigger(mensaje); }],
+    ]);
+    const { codigo, cuerpo } = await invocar(handler, "PUT", "/v1/procad/accesos/personas/20", { activo: true });
+    assert.equal(codigo, 409);
+    assert.equal(cuerpo.error, mensaje);
+  });
+});

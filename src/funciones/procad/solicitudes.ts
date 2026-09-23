@@ -58,7 +58,7 @@ export interface FiltrosSolicitudes {
   texto: string | null;
 }
 
-export function listarSolicitudes(f: FiltrosSolicitudes) {
+export async function listarSolicitudes(f: FiltrosSolicitudes) {
   const filtros = new Filtros()
     .si(f.campus, "campus", sql.Int, "g.idCampus = @campus")
     .si(f.tipoGrupo, "tipoGrupo", sql.NVarChar(20), "tg.nombreTipoGrupo = @tipoGrupo")
@@ -70,12 +70,33 @@ export function listarSolicitudes(f: FiltrosSolicitudes) {
       "(p.nombrePersona + N' ' + p.apellidosPersona LIKE @texto OR de.numeroCuenta LIKE @texto)",
     );
 
-  return consultar(`
-    SELECT ${COLUMNAS_SOLICITUD}
+  // Trae tambien lo de la ficha (contacto, posicion, instrumento, experiencia):
+  // la tabla del panel lo muestra sin abrir cada solicitud.
+  const filas = await consultar<Record<string, unknown>>(`
+    SELECT ${COLUMNAS_SOLICITUD},
+           p.telefonoPersona, p.sexoPersona,
+           de.carreraEstudiante, de.indicePeriodo, de.indiceGlobal, de.matriculaVerificada,
+           pe.anioPeriodo, pe.numeroPac,
+           d.contactoEmergenciaNombre, d.contactoEmergenciaTelefono,
+           po.nombrePosicion, i.nombreInstrumento, d.nivelExperiencia, d.alergia,
+           (SELECT a.tipoAdjunto, a.contenidoTexto, a.urlArchivo
+              FROM Procad.tblAdjuntosSolicitudes a
+             WHERE a.idSolicitud = s.idSolicitud
+             ORDER BY a.idAdjunto
+               FOR JSON PATH) AS adjuntos
     ${DESDE_SOLICITUD}
+     INNER JOIN Catalogo.tblPeriodos pe ON pe.idPeriodo = s.idPeriodo
+      LEFT JOIN Procad.tblDetallesSolicitudes d ON d.idSolicitud = s.idSolicitud
+      LEFT JOIN Procad.tblPosiciones po        ON po.idPosicion = d.idPosicion
+      LEFT JOIN Procad.tblInstrumentos i       ON i.idInstrumento = d.idInstrumento
     ${filtros.where}
      ORDER BY s.fechaRegistro DESC
   `, filtros.parametros);
+
+  return filas.map((fila) => ({
+    ...fila,
+    adjuntos: typeof fila["adjuntos"] === "string" ? JSON.parse(fila["adjuntos"]) : [],
+  }));
 }
 
 /** Ficha completa: solicitud, estudiante, detalle, adjuntos de experiencia e historial de estados. */
@@ -321,6 +342,47 @@ export async function autorizarCondicionado(idSolicitud: number, idPersonaAutori
   return obtenerSolicitud(idSolicitud);
 }
 
+/**
+ * El administrador no acepta la propuesta: se retira, y la solicitud queda
+ * como estaba (PENDIENTE, sin excepcion). No cambia de estado, pero el
+ * rechazo y su motivo quedan en el historial de la solicitud para que el
+ * director sepa por que no procedio.
+ */
+export async function rechazarCondicionado(
+  idSolicitud: number,
+  r: { idPersona: number; motivo: string | null },
+  usuario: string,
+) {
+  await enTransaccion(async (ejecutar) => {
+    const actual = await bloquearSolicitud(ejecutar, idSolicitud);
+    if (actual.esCondicionado) {
+      throw conflicto(`La solicitud ${idSolicitud} ya fue autorizada como condicionado: no se puede rechazar la propuesta.`);
+    }
+    const propuesta = await ejecutar<{ propone: number | null }>(
+      "SELECT idPersonaProponeCondicionado AS propone FROM Procad.tblSolicitudes WHERE idSolicitud = @id",
+      { id: [sql.Int, idSolicitud] },
+    );
+    if (propuesta[0]?.propone == null) {
+      throw conflicto(`La solicitud ${idSolicitud} no tiene una propuesta de condicionado.`);
+    }
+
+    await ejecutar(`
+      UPDATE Procad.tblSolicitudes
+         SET idPersonaProponeCondicionado = NULL, fechaActualizacion = SYSDATETIME()
+       WHERE idSolicitud = @id
+    `, { id: [sql.Int, idSolicitud] });
+
+    await registrarCambioDeEstado(ejecutar, {
+      idSolicitud,
+      idPersona: r.idPersona,
+      idEstadoAnterior: actual.idEstado,
+      observacion: `Propuesta de condicionado rechazada.${r.motivo ? ` ${r.motivo}` : ""}`.slice(0, 300),
+      usuario,
+    });
+  });
+  return obtenerSolicitud(idSolicitud);
+}
+
 /* ------------------------------- Expulsiones ------------------------------ */
 
 const COLUMNAS_EXPULSION = `
@@ -461,12 +523,13 @@ export async function resolverExpulsion(idExpulsion: number, r: ResolucionExpuls
 
 const COLUMNAS_MATRICULA = `
   me.idMatriculaExcepcional, me.idPersona, ${ESTUDIANTE},
-  me.idPeriodo, me.motivoExcepcion, me.estadoExcepcion,
+  me.idPeriodo, pe.anioPeriodo, pe.numeroPac, me.motivoExcepcion, me.estadoExcepcion,
   me.idPersonaAutoriza, pa.nombrePersona AS nombreAutoriza, pa.apellidosPersona AS apellidosAutoriza,
   me.fechaRegistro`;
 
 const DESDE_MATRICULA = `
   FROM Procad.tblMatriculasExcepcionales me
+ INNER JOIN Catalogo.tblPeriodos pe  ON pe.idPeriodo = me.idPeriodo
  INNER JOIN Catalogo.tblPersonas p   ON p.idPersona = me.idPersona
   LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = me.idPersona
  INNER JOIN Catalogo.tblPersonas pa  ON pa.idPersona = me.idPersonaAutoriza`;
@@ -483,7 +546,9 @@ export function listarMatriculasExcepcionales(f: { periodo: number | null; soloA
 }
 
 export interface NuevaMatriculaExcepcional {
-  idPersona: number;
+  /** Uno de los dos: el id de la persona o su numero de cuenta. */
+  idPersona: number | null;
+  numeroCuenta: string | null;
   idPeriodo: number;
   motivoExcepcion: string;
   idPersonaAutoriza: number;
@@ -491,13 +556,24 @@ export interface NuevaMatriculaExcepcional {
 
 /** Una sola firma, la de un administrador: la exige tgrMatriculasExcepcionalesAutorizanteEsAdmin. */
 export async function crearMatriculaExcepcional(m: NuevaMatriculaExcepcional, usuario: string) {
+  let idPersona = m.idPersona;
+  if (idPersona === null) {
+    // El panel pide la cuenta, que es como el administrador identifica al estudiante.
+    const estudiante = await consultarUna<{ idPersona: number }>(
+      "SELECT idPersona FROM Catalogo.tblDetallesEstudiantes WHERE numeroCuenta = @cuenta",
+      { cuenta: [sql.NVarChar(15), m.numeroCuenta] },
+    );
+    if (!estudiante) throw noEncontrado(`No existe un estudiante con numero de cuenta ${m.numeroCuenta}.`);
+    idPersona = estudiante.idPersona;
+  }
+
   const filas = await consultar<{ id: number }>(`
     INSERT INTO Procad.tblMatriculasExcepcionales
       (idPersona, idPeriodo, motivoExcepcion, idPersonaAutoriza, usuarioRegistro)
     VALUES (@persona, @periodo, @motivo, @autoriza, @usuario);
     SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
   `, {
-    persona: [sql.Int, m.idPersona],
+    persona: [sql.Int, idPersona],
     periodo: [sql.Int, m.idPeriodo],
     motivo: [sql.NVarChar(300), m.motivoExcepcion],
     autoriza: [sql.Int, m.idPersonaAutoriza],

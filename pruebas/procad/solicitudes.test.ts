@@ -24,9 +24,12 @@ describe("GET /solicitudes", () => {
     assert.doesNotMatch(texto, /ana/);
   });
 
-  test("sin filtros no hay WHERE", async () => {
+  test("sin filtros no filtra nada", async () => {
     await invocar(handler, "GET", "/v1/procad/solicitudes");
-    assert.doesNotMatch(llamadaCon(/FROM Procad\.tblSolicitudes s/).texto, /WHERE/);
+    const { texto, parametros } = llamadaCon(/FROM Procad\.tblSolicitudes s/);
+    assert.deepEqual(parametros, {});
+    // El unico WHERE es el de la subconsulta de adjuntos.
+    assert.equal(texto.match(/WHERE/g)?.length, 1);
   });
 
   test("un estado que no existe es 400", async () => {
@@ -327,5 +330,72 @@ describe("Condicionados por reconfirmar", () => {
     await invocar(handler, "GET", "/v1/procad/condicionados");
     const { texto } = llamadaCon(/OUTER APPLY/);
     assert.match(texto, /s\.esCondicionado = 1 OR/);
+  });
+});
+
+describe("Ajustes para el frontend", () => {
+  test("GET /solicitudes trae la ficha y los adjuntos como lista", async () => {
+    responderPor([[/FROM Procad\.tblSolicitudes s/, [{
+      idSolicitud: 7, contactoEmergenciaNombre: "Rosa", nombrePosicion: "Base",
+      adjuntos: '[{"tipoAdjunto":"texto","contenidoTexto":"5 anios en el coro"}]',
+    }]]]);
+    const { codigo, cuerpo } = await invocar(handler, "GET", "/v1/procad/solicitudes");
+
+    assert.equal(codigo, 200);
+    assert.equal(cuerpo[0].contactoEmergenciaNombre, "Rosa");
+    assert.deepEqual(cuerpo[0].adjuntos, [{ tipoAdjunto: "texto", contenidoTexto: "5 anios en el coro" }]);
+    assert.match(llamadaCon(/FROM Procad\.tblSolicitudes s/).texto, /LEFT JOIN Procad\.tblDetallesSolicitudes d/);
+  });
+
+  test("rechazar una propuesta la retira y deja el motivo en el historial", async () => {
+    responderPor([
+      [/WITH \(UPDLOCK\)/, [{ idEstado: 17, codigoEstado: "PENDIENTE", esCondicionado: false }]],
+      [/AS propone FROM/, [{ propone: 20 }]],
+      [/FROM Procad\.tblSolicitudes s/, [SOLICITUD]],
+    ]);
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/condicionados/7/rechazo", {
+      idPersona: 30, motivo: "No hay evidencia suficiente",
+    });
+
+    assert.equal(codigo, 200);
+    assert.match(llamadaCon(/UPDATE Procad\.tblSolicitudes/).texto, /idPersonaProponeCondicionado = NULL/);
+    const log = llamadaCon(/INSERT INTO Procad\.tblLogsEstadosSolicitudes/);
+    assert.match(String(log.parametros["observacion"]), /rechazada\. No hay evidencia/);
+  });
+
+  test("rechazar sin propuesta es 409", async () => {
+    responderPor([
+      [/WITH \(UPDLOCK\)/, [{ idEstado: 17, codigoEstado: "PENDIENTE", esCondicionado: false }]],
+      [/AS propone FROM/, [{ propone: null }]],
+    ]);
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/condicionados/7/rechazo", { idPersona: 30 });
+    assert.equal(codigo, 409);
+  });
+
+  test("matricula excepcional por numero de cuenta", async () => {
+    responderPor([
+      [/FROM Catalogo\.tblDetallesEstudiantes WHERE numeroCuenta/, [{ idPersona: 3 }]],
+      [/INSERT INTO/, [{ id: 9 }]],
+      [/FROM Procad\.tblMatriculasExcepcionales/, [{ idMatriculaExcepcional: 9 }]],
+    ]);
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/matriculas-excepcionales", {
+      numeroCuenta: "20201000123", idPeriodo: 4, idPersonaAutoriza: 30, motivoExcepcion: "Apoyo en evento",
+    });
+    assert.equal(codigo, 201);
+    assert.equal(llamadaCon(/INSERT INTO/).parametros["persona"], 3);
+  });
+
+  test("matricula excepcional con una cuenta que no existe es 404", async () => {
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/matriculas-excepcionales", {
+      numeroCuenta: "999", idPeriodo: 4, idPersonaAutoriza: 30, motivoExcepcion: "X",
+    });
+    assert.equal(codigo, 404);
+  });
+
+  test("matricula excepcional con idPersona y cuenta a la vez es 400", async () => {
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/matriculas-excepcionales", {
+      idPersona: 3, numeroCuenta: "1", idPeriodo: 4, idPersonaAutoriza: 30, motivoExcepcion: "X",
+    });
+    assert.equal(codigo, 400);
   });
 });

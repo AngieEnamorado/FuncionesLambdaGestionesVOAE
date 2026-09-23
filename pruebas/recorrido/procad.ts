@@ -231,6 +231,8 @@ async function rondaPrincipal(b: Base): Promise<void> {
   await paso("lista las 6 pendientes del grupo", "GET", `/solicitudes?grupo=${g}&estado=PENDIENTE`, undefined, 200,
     (c) => c.length === 6 || `${c.length} filas`);
   await paso("busca por nombre", "GET", `/solicitudes?grupo=${g}&q=sofia`, undefined, 200, (c) => c.length === 1);
+  await paso("el listado trae el periodo y la ficha", "GET", `/solicitudes?grupo=${g}`, undefined, 200,
+    (c) => c[0].anioPeriodo === 2090 && Array.isArray(c[0].adjuntos));
 
   // Resoluciones.
   await paso("aprueba a Juan", "POST", `/solicitudes/${s.juan}/resolucion`, { decision: "APROBADO", idPersona: b.dir }, 200,
@@ -253,6 +255,11 @@ async function rondaPrincipal(b: Base): Promise<void> {
     (c) => c.esCondicionado === true);
   await paso("con las dos firmas, Carla se aprueba", "POST", `/solicitudes/${s.carla}/resolucion`,
     { decision: "APROBADO", idPersona: b.dir }, 200, (c) => c.codigoEstado === "APROBADO");
+
+  await paso("el director propone a Sofia", "POST", "/condicionados", { idSolicitud: s.sofia, idPersonaPropone: b.dir }, 201);
+  await paso("la admin rechaza la propuesta de Sofia, con motivo", "POST", `/condicionados/${s.sofia}/rechazo`,
+    { idPersona: b.adm, motivo: "Sin evidencia de trayectoria" }, 200,
+    (c) => c.idPersonaProponeCondicionado === null && c.historial.some((h: any) => /rechazada/.test(h.observacionCambio)));
 
   await paso("Juan pasa al equipo", "PUT", `/solicitudes/${s.juan}/equipo`, { esEquipo: true }, 200, (c) => c.esEquipo === true);
   await paso("Sofia (OBSERVADO) no puede ser del equipo", "PUT", `/solicitudes/${s.sofia}/equipo`, { esEquipo: true }, 409);
@@ -289,8 +296,8 @@ async function rondaPrincipal(b: Base): Promise<void> {
   await paso("cita a Sofia", "POST", `/visorias/${vis.idVisoria}/citados`, { solicitudes: [s.sofia] }, 200,
     (c) => c.estudiantes.length === 1);
 
-  await paso("matricula excepcional para Pedro", "POST", "/matriculas-excepcionales",
-    { idPersona: b.pedro, idPeriodo: b.p1, motivoExcepcion: "Apoyo en la organizacion del festival VOAE", idPersonaAutoriza: b.adm }, 201);
+  await paso("matricula excepcional para Pedro, por numero de cuenta", "POST", "/matriculas-excepcionales",
+    { numeroCuenta: `2090${String(b.pedro).padStart(7, "0")}`, idPeriodo: b.p1, motivoExcepcion: "Apoyo en la organizacion del festival VOAE", idPersonaAutoriza: b.adm }, 201);
 
   // Expulsion con motivo Otro.
   const exp = await paso("el director pide expulsar a Maria (motivo Otro, con detalle)", "POST", "/expulsiones",
@@ -322,6 +329,10 @@ async function rondaPrincipal(b: Base): Promise<void> {
   }
 
   await paso("accesos del grupo", "GET", `/accesos?grupo=${g}`, undefined, 200, (c) => c.length === 1);
+  await paso("revoca el acceso del director", "PUT", `/accesos/personas/${b.dir}`, { activo: false }, 200,
+    (c) => c.every((x: any) => x.activo === false));
+  await paso("se lo vuelve a otorgar", "PUT", `/accesos/personas/${b.dir}`, { activo: true }, 200,
+    (c) => c.every((x: any) => x.activo === true));
   await paso("PROSENE responde", "GET", "/prosene", undefined, 200);
 }
 

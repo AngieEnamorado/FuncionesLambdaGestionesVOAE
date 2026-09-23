@@ -63,6 +63,16 @@ function tipoGrupoOpcional(valor: unknown): string | null {
   return texto;
 }
 
+/** idPersona o numeroCuenta, uno de los dos. */
+function personaPorIdOCuenta(cuerpo: Record<string, unknown>) {
+  const idPersona = enteroOpcional(cuerpo["idPersona"], "idPersona");
+  const numeroCuenta = textoOpcional(cuerpo["numeroCuenta"], "numeroCuenta", 15);
+  if ((idPersona === null) === (numeroCuenta === null)) {
+    throw solicitudInvalida("Hay que enviar idPersona o numeroCuenta, uno de los dos.");
+  }
+  return { idPersona, numeroCuenta };
+}
+
 /* ------------------------------ Catalogos ------------------------------- */
 
 router.get("/catalogos", async ({ consulta }) => catalogos.listarCatalogos(incluirInactivos(consulta)));
@@ -128,6 +138,18 @@ router.post("/condicionados/{id}/autorizacion", async (peticion) =>
   ),
 );
 
+/** Paso 2, si el administrador no esta de acuerdo: retira la propuesta. */
+router.post("/condicionados/{id}/rechazo", async (peticion) =>
+  solicitudes.rechazarCondicionado(
+    idDeRuta(peticion),
+    {
+      idPersona: enteroRequerido(peticion.cuerpo["idPersona"], "idPersona"),
+      motivo: textoOpcional(peticion.cuerpo["motivo"], "motivo", 250),
+    },
+    peticion.usuarioRegistro,
+  ),
+);
+
 /* ------------------------------ Expulsiones ------------------------------ */
 
 router.get("/expulsiones", async ({ consulta }) =>
@@ -173,7 +195,7 @@ router.get("/matriculas-excepcionales", async ({ consulta }) =>
 
 router.post("/matriculas-excepcionales", async ({ cuerpo, usuarioRegistro }) =>
   creado(await solicitudes.crearMatriculaExcepcional({
-    idPersona: enteroRequerido(cuerpo["idPersona"], "idPersona"),
+    ...personaPorIdOCuenta(cuerpo),
     idPeriodo: enteroRequerido(cuerpo["idPeriodo"], "idPeriodo"),
     motivoExcepcion: textoRequerido(cuerpo["motivoExcepcion"], "motivoExcepcion", 300),
     idPersonaAutoriza: enteroRequerido(cuerpo["idPersonaAutoriza"], "idPersonaAutoriza"),
@@ -426,6 +448,12 @@ router.get("/accesos", async ({ consulta }) =>
     incluirInactivos: incluirInactivos(consulta),
   }),
 );
+
+router.put("/accesos/personas/{id}", async (peticion) => {
+  const activo = booleanoOpcional(peticion.cuerpo["activo"], "activo");
+  if (activo === null) throw solicitudInvalida("El campo activo es obligatorio: true o false.");
+  return grupos.cambiarAccesoPersona(idDeRuta(peticion), activo);
+});
 
 /* -------------------------------- Salud --------------------------------- */
 
