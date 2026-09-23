@@ -7,7 +7,11 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "node infra/construir.mjs",
-    "deploy": "bash infra/desplegar.sh"
+    "deploy": "bash infra/desplegar.sh",
+    "test": "node infra/probar.mjs",
+    "verificar-sql": "node infra/verificar-sql.mjs",
+    "local": "node infra/servidor-local.mjs",
+    "recorrido": "node infra/recorrido.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-secrets-manager": "^3.706.0",

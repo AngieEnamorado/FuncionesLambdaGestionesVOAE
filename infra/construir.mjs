@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 const raiz = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const paquete = JSON.parse(readFileSync(join(raiz, "package.json"), "utf8"));
 
-const FUNCIONES_DISPONIBLES = ["catalogo", "voluntariado", "giras"];
+const FUNCIONES_DISPONIBLES = ["catalogo", "voluntariado", "giras", "procad"];
 const pedidas = process.argv.slice(2);
 const funciones = pedidas.length > 0 ? pedidas : FUNCIONES_DISPONIBLES;
 
