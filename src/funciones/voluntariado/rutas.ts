@@ -19,6 +19,7 @@ import {
   textoRequerido,
 } from "../../compartido/validacion";
 import * as consultas from "./consultas";
+import * as reporteria from "../reporteria/voluntariado";
 
 export const router = crearRouter("/v1/voluntariado");
 
@@ -551,11 +552,13 @@ router.get("/personas/{idPersona}/participaciones", async ({ parametros }) =>
 router.get("/personas/{idPersona}/solicitudes", async ({ parametros }) =>
   consultas.listarSolicitudesPersona(enteroRequerido(parametros["idPersona"], "idPersona")));
 
-/* ------------------ Tablero y estadisticas (provisional) ---------------- */
+/* ------------------ Tablero y estadisticas (provisional) ----------------
+   Ya viven en voae-reporteria. Se dejan aqui mientras haya un frontend
+   desplegado que las llame; se borran cuando todos apunten a reporteria. */
 
-router.get("/tablero", async () => consultas.obtenerTablero());
+router.get("/tablero", async () => reporteria.obtenerTablero());
 
-router.get("/estadisticas", async () => consultas.listarEstadisticas());
+router.get("/estadisticas", async () => reporteria.listarEstadisticas());
 
 /* ------------------------------ Diagnostico ----------------------------- */
 
