@@ -11,6 +11,7 @@
  */
 import { crearRouter, creado, type Peticion } from "../../compartido/router";
 import { noEncontrado, solicitudInvalida } from "../../compartido/errores";
+import { exigirBucket, exigirLlaveDe, firmarSubida, urlDeDescarga } from "../../compartido/archivos";
 import {
   booleanoOpcional,
   enteroOpcional,
@@ -22,6 +23,18 @@ import * as consultas from "./consultas";
 import * as reporteria from "../reporteria/voluntariado";
 
 export const router = crearRouter("/v1/voluntariado");
+
+/* Prefijo de S3 de cada registro que puede llevar archivos. Las llaves que se
+   registran en la base tienen que colgar del prefijo de su registro. */
+const PREFIJO_ARCHIVOS = {
+  SOLICITUD_GRUPO: (id: number) => `voluntariado/solicitudes-grupos/${id}/`,
+  ACTIVIDAD: (id: number) => `voluntariado/actividades/${id}/`,
+} as const;
+
+/** Agrega urlDescarga (firmada, de vida corta) a cada fila que trae archivoUrl. */
+async function conDescarga<T extends { archivoUrl: string }>(filas: T[]) {
+  return Promise.all(filas.map(async (f) => ({ ...f, urlDescarga: await urlDeDescarga(f.archivoUrl) })));
+}
 
 const UMBRAL_DIPLOMA_POR_DEFECTO = 80;
 
@@ -144,7 +157,7 @@ router.get("/solicitudes-grupos/{id}", async ({ parametros }) => {
   const id = enteroRequerido(parametros["id"], "id");
   const solicitud = await consultas.obtenerSolicitudGrupo(id);
   if (!solicitud) throw noEncontrado(`No existe la solicitud ${id}.`);
-  return solicitud;
+  return { ...solicitud, adjuntos: await conDescarga(solicitud.adjuntos as { archivoUrl: string }[]) };
 });
 
 router.post("/solicitudes-grupos", async ({ cuerpo, usuarioRegistro }) => {
@@ -206,10 +219,12 @@ router.post("/solicitudes-grupos/{id}/resolucion", async ({ parametros, cuerpo, 
 router.post("/solicitudes-grupos/{id}/adjuntos", async ({ parametros, cuerpo, usuarioRegistro }) => {
   const id = enteroRequerido(parametros["id"], "id");
   // La base guarda la llave del objeto en S3, nunca el binario.
+  const llave = textoRequerido(cuerpo["archivoUrl"], "archivoUrl", 300);
+  exigirLlaveDe(llave, PREFIJO_ARCHIVOS.SOLICITUD_GRUPO(id));
   const adjunto = await consultas.agregarAdjuntoSolicitud(
     id,
     enteroRequerido(cuerpo["idRequisitoAdjunto"], "idRequisitoAdjunto"),
-    textoRequerido(cuerpo["archivoUrl"], "archivoUrl", 300),
+    llave,
     usuarioRegistro,
   );
   return creado(adjunto);
@@ -263,7 +278,7 @@ router.get("/actividades/{id}", async ({ parametros }) => {
   const id = enteroRequerido(parametros["id"], "id");
   const actividad = await consultas.obtenerActividad(id);
   if (!actividad) throw noEncontrado(`No existe la actividad ${id}.`);
-  return actividad;
+  return { ...actividad, fotos: await conDescarga(actividad.fotos as { archivoUrl: string }[]) };
 });
 
 router.post("/actividades", async ({ cuerpo, usuarioRegistro }) => {
@@ -303,9 +318,11 @@ router.put("/actividades/{id}/resultados", async ({ parametros, cuerpo }) => {
 
 router.post("/actividades/{id}/fotos", async ({ parametros, cuerpo, usuarioRegistro }) => {
   const id = enteroRequerido(parametros["id"], "id");
+  const llave = textoRequerido(cuerpo["archivoUrl"], "archivoUrl", 300);
+  exigirLlaveDe(llave, PREFIJO_ARCHIVOS.ACTIVIDAD(id));
   return creado(await consultas.agregarFoto(
     id,
-    textoRequerido(cuerpo["archivoUrl"], "archivoUrl", 300),
+    llave,
     textoOpcional(cuerpo["descripcion"], "descripcion", 200),
     enteroOpcional(cuerpo["idRequisitoAdjunto"], "idRequisitoAdjunto"),
     usuarioRegistro,
@@ -559,6 +576,40 @@ router.get("/personas/{idPersona}/solicitudes", async ({ parametros }) =>
 router.get("/tablero", async () => reporteria.obtenerTablero());
 
 router.get("/estadisticas", async () => reporteria.listarEstadisticas());
+
+/* ------------------------------- Archivos -------------------------------
+   El archivo va del navegador directo a S3. Aqui solo se firma la subida y,
+   para mostrarlo, la descarga. Registrar la llave en la base sigue siendo
+   POST /solicitudes-grupos/{id}/adjuntos o POST /actividades/{id}/fotos. */
+
+router.post("/archivos/subidas", async ({ cuerpo }) => {
+  const proceso = textoRequerido(cuerpo["proceso"], "proceso", 30).toUpperCase();
+  if (proceso !== "SOLICITUD_GRUPO" && proceso !== "ACTIVIDAD") {
+    throw solicitudInvalida("proceso debe ser SOLICITUD_GRUPO o ACTIVIDAD.");
+  }
+  const idReferencia = enteroRequerido(cuerpo["idReferencia"], "idReferencia");
+  const existe = proceso === "ACTIVIDAD"
+    ? await consultas.obtenerActividad(idReferencia)
+    : await consultas.obtenerSolicitudGrupo(idReferencia);
+  if (!existe) throw noEncontrado(`No existe ${proceso === "ACTIVIDAD" ? "la actividad" : "la solicitud"} ${idReferencia}.`);
+
+  return creado(await firmarSubida(
+    PREFIJO_ARCHIVOS[proceso](idReferencia),
+    textoRequerido(cuerpo["nombreArchivo"], "nombreArchivo", 200),
+    textoRequerido(cuerpo["tipoContenido"], "tipoContenido", 100).toLowerCase(),
+  ));
+});
+
+router.get("/archivos/descarga", async ({ consulta }) => {
+  exigirBucket();
+  const llave = textoRequerido(consulta["llave"], "llave", 300);
+  if (!llave.startsWith("voluntariado/") || llave.includes("..")) {
+    throw solicitudInvalida("Solo se firman descargas de archivos de Voluntariado.");
+  }
+  const url = await urlDeDescarga(llave);
+  if (!url) throw noEncontrado("No hay archivo que descargar para esa llave.");
+  return { url };
+});
 
 /* ------------------------------ Diagnostico ----------------------------- */
 

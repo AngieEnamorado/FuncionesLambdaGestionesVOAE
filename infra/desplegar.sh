@@ -54,6 +54,10 @@ fi
 
 cuenta="$(aws_ sts get-caller-identity --query Account --output text)"
 arn_secreto="$(aws_ secretsmanager describe-secret --secret-id "$SECRETO" --query ARN --output text)"
+# Bucket privado de archivos de usuario. Lo crea infra/archivos.sh; aqui solo
+# se le pasa el nombre a la funcion. Sin el bucket, las rutas de archivos
+# responden 501 y el resto de la funcion sigue igual.
+BUCKET_ARCHIVOS="voae-archivos-${cuenta}"
 
 # ----------------------------------------------------------------- rol -----
 echo "==> Rol de ejecucion ${ROL}"
@@ -106,7 +110,7 @@ if aws_ lambda get-function --function-name "$FUNCION" >/dev/null 2>&1; then
     --runtime "$RUNTIME" \
     --memory-size "$MEMORIA_MB" \
     --timeout "$TIMEOUT_S" \
-    --environment "Variables={ID_SECRETO_VOAE=${SECRETO}}" \
+    --environment "Variables={ID_SECRETO_VOAE=${SECRETO},BUCKET_ARCHIVOS=${BUCKET_ARCHIVOS}}" \
     --query 'LastModified' --output text
   aws_ lambda wait function-updated --function-name "$FUNCION"
 else
@@ -120,7 +124,7 @@ else
       --zip-file "fileb://${zip}" \
       --memory-size "$MEMORIA_MB" \
       --timeout "$TIMEOUT_S" \
-      --environment "Variables={ID_SECRETO_VOAE=${SECRETO}}" \
+      --environment "Variables={ID_SECRETO_VOAE=${SECRETO},BUCKET_ARCHIVOS=${BUCKET_ARCHIVOS}}" \
       --description "Gestiones VOAE: ${FUNCION}" \
       --query 'FunctionArn' --output text 2>/dev/null; then
       break

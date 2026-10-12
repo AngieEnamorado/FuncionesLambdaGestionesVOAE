@@ -10,7 +10,10 @@
     "deploy": "bash infra/desplegar.sh"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1134.0",
     "@aws-sdk/client-secrets-manager": "^3.706.0",
+    "@aws-sdk/s3-presigned-post": "^3.1134.0",
+    "@aws-sdk/s3-request-presigner": "^3.1134.0",
     "mssql": "^11.0.1"
   },
   "devDependencies": {
