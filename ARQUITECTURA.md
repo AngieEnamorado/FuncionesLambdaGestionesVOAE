@@ -374,6 +374,14 @@ Antes de escribir lógica de negocio en un handler, revisar si ya existe un trig
 - Los archivos subidos por usuarios (documentos de giras, evidencia fotográfica, adjuntos, logos de
   grupos) van a un bucket **separado y privado**, con subida por URL prefirmada. La base de datos
   guarda la llave del objeto, nunca el binario.
+  **Construido para Voluntariado (2026-10-12):** `infra/archivos.sh` crea `voae-archivos-<cuenta>`
+  (privado, cifrado, CORS para POST/GET). `voae-voluntariado` firma la subida con
+  `POST /archivos/subidas` (POST de formulario, no PUT, para que S3 imponga tipo y 10 MB máximo) y
+  la descarga con `GET /archivos/descarga`; el detalle de actividad y de solicitud ya trae
+  `urlDescarga` firmada por archivo. Al registrar una llave se exige que cuelgue del prefijo de su
+  registro (`voluntariado/actividades/{id}/`, `voluntariado/solicitudes-grupos/{id}/`). Las llaves
+  `prototipo/...` de la semilla se siguen aceptando. Giras y PROCAD pueden usar el mismo
+  `compartido/archivos.ts`.
 - **Las rutas de la API son independientes del número de Lambdas.** El mapeo ruta → función es
   configuración de API Gateway; se puede cambiar después sin tocar una línea del frontend. Esta
   decisión es reversible.
