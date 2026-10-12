@@ -57,6 +57,46 @@ async function exigirGrupo(idGrupo: number): Promise<void> {
 
 router.get("/catalogos", async () => consultas.listarCatalogos());
 
+router.post("/redes", async ({ cuerpo, usuarioRegistro }) =>
+  creado(await consultas.crearRedTematica(
+    textoRequerido(cuerpo["nombreRedTematica"], "nombreRedTematica", 120),
+    usuarioRegistro,
+  )));
+
+router.put("/redes/{id}", async ({ parametros, cuerpo }) => {
+  const id = enteroRequerido(parametros["id"], "id");
+  const red = await consultas.actualizarRedTematica(
+    id,
+    textoOpcional(cuerpo["nombreRedTematica"], "nombreRedTematica", 120),
+    booleanoOpcional(cuerpo["activa"], "activa"),
+  );
+  if (!red) throw noEncontrado(`No existe la red tematica ${id}.`);
+  return red;
+});
+
+router.post("/trimestres", async ({ cuerpo, usuarioRegistro }) => {
+  const numero = enteroRequerido(cuerpo["numeroTrimestre"], "numeroTrimestre");
+  if (numero > 4) throw solicitudInvalida("numeroTrimestre va de 1 a 4.");
+  return creado(await consultas.crearTrimestre({
+    anioTrimestre: enteroRequerido(cuerpo["anioTrimestre"], "anioTrimestre"),
+    numeroTrimestre: numero,
+    fechaInicioTrimestre: textoOpcional(cuerpo["fechaInicioTrimestre"], "fechaInicioTrimestre", 10),
+    fechaFinTrimestre: textoOpcional(cuerpo["fechaFinTrimestre"], "fechaFinTrimestre", 10),
+    fechaLimiteInforme: textoOpcional(cuerpo["fechaLimiteInforme"], "fechaLimiteInforme", 10),
+  }, usuarioRegistro));
+});
+
+router.put("/trimestres/{id}", async ({ parametros, cuerpo }) => {
+  const id = enteroRequerido(parametros["id"], "id");
+  const trimestre = await consultas.actualizarTrimestre(id, {
+    inicio: textoOpcional(cuerpo["fechaInicioTrimestre"], "fechaInicioTrimestre", 10),
+    fin: textoOpcional(cuerpo["fechaFinTrimestre"], "fechaFinTrimestre", 10),
+    limite: textoOpcional(cuerpo["fechaLimiteInforme"], "fechaLimiteInforme", 10),
+  });
+  if (!trimestre) throw noEncontrado(`No existe el trimestre ${id}.`);
+  return trimestre;
+});
+
 /* -------------------------------- Grupos -------------------------------- */
 
 router.get("/grupos", async ({ consulta }) =>
@@ -77,6 +117,12 @@ router.get("/grupos/{idGrupo}/miembros", async ({ parametros, consulta }) => {
   await exigirGrupo(idGrupo);
   const soloActivos = booleanoOpcional(consulta["activos"], "activos") ?? true;
   return consultas.listarMiembros(idGrupo, soloActivos);
+});
+
+router.put("/grupos/{idGrupo}/coordinador", async ({ parametros, cuerpo }) => {
+  const idGrupo = enteroRequerido(parametros["idGrupo"], "idGrupo");
+  await exigirGrupo(idGrupo);
+  return consultas.reasignarCoordinador(idGrupo, enteroRequerido(cuerpo["idPersona"], "idPersona"));
 });
 
 router.get("/grupos/{idGrupo}/campus", async ({ parametros }) => {
@@ -151,7 +197,9 @@ router.post("/solicitudes-grupos/{id}/resolucion", async ({ parametros, cuerpo, 
   if (estado !== "APROBADA" && motivo === null) {
     throw solicitudInvalida("Rechazar o devolver una solicitud exige un motivo.");
   }
-  return consultas.resolverSolicitudGrupo(id, estado, motivo, usuarioRegistro);
+  const redes = lista(cuerpo["redesTematicas"], "redesTematicas").map((idRed, indice) =>
+    enteroRequerido(idRed, `redesTematicas[${indice}]`));
+  return consultas.resolverSolicitudGrupo(id, estado, motivo, redes, usuarioRegistro);
 });
 
 router.post("/solicitudes-grupos/{id}/adjuntos", async ({ parametros, cuerpo, usuarioRegistro }) => {
@@ -312,6 +360,19 @@ router.post("/actividades/{id}/asistencia", async ({ parametros, cuerpo, usuario
   );
 });
 
+router.post("/actividades/{id}/inscripciones", async ({ parametros, cuerpo, usuarioRegistro }) =>
+  creado(await consultas.inscribirEnActividad(
+    enteroRequerido(parametros["id"], "id"),
+    enteroRequerido(cuerpo["idPersona"], "idPersona"),
+    usuarioRegistro,
+  )));
+
+router.delete("/actividades/{id}/inscripciones/{idPersona}", async ({ parametros }) =>
+  consultas.cancelarInscripcion(
+    enteroRequerido(parametros["id"], "id"),
+    enteroRequerido(parametros["idPersona"], "idPersona"),
+  ));
+
 /* --------------------------- Informes trimestrales ---------------------- */
 
 router.get("/informes", async (peticion) =>
@@ -460,6 +521,41 @@ router.post("/diplomas", async ({ cuerpo, usuarioRegistro }) => {
     archivoUrl: textoOpcional(cuerpo["archivoUrl"], "archivoUrl", 300),
   }, usuarioRegistro));
 });
+
+router.get("/diplomas/participacion", async ({ consulta }) => {
+  const idGrupo = enteroOpcional(consulta["grupo"], "grupo");
+  if (idGrupo !== null) await exigirGrupo(idGrupo);
+  return {
+    umbral: UMBRAL_DIPLOMA_POR_DEFECTO,
+    miembros: await consultas.listarParticipacionMiembros(
+      idGrupo,
+      enteroOpcional(consulta["trimestre"], "trimestre"),
+    ),
+  };
+});
+
+/* ------------------------------- Personas ------------------------------- */
+
+router.get("/personas", async () => consultas.listarPersonasVoluntariado());
+
+router.get("/personas/{idPersona}", async ({ parametros }) => {
+  const idPersona = enteroRequerido(parametros["idPersona"], "idPersona");
+  const persona = await consultas.obtenerResumenPersona(idPersona);
+  if (!persona) throw noEncontrado(`No existe la persona ${idPersona}.`);
+  return persona;
+});
+
+router.get("/personas/{idPersona}/participaciones", async ({ parametros }) =>
+  consultas.listarParticipacionesPersona(enteroRequerido(parametros["idPersona"], "idPersona")));
+
+router.get("/personas/{idPersona}/solicitudes", async ({ parametros }) =>
+  consultas.listarSolicitudesPersona(enteroRequerido(parametros["idPersona"], "idPersona")));
+
+/* ------------------ Tablero y estadisticas (provisional) ---------------- */
+
+router.get("/tablero", async () => consultas.obtenerTablero());
+
+router.get("/estadisticas", async () => consultas.listarEstadisticas());
 
 /* ------------------------------ Diagnostico ----------------------------- */
 
