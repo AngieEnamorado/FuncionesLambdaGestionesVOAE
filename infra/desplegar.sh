@@ -26,19 +26,30 @@ RUNTIME="nodejs22.x"
 MEMORIA_MB=512
 
 # Los dominios escriben en varias tablas por peticion y aguantan mas que una
-# lectura de catalogo, asi que se les da mas margen.
+# lectura de catalogo, asi que se les da mas margen. Reporteria agrega sobre
+# tablas completas: mas memoria (en Lambda tambien compra CPU) y 29 s, que es
+# lo mas que deja esperar la HTTP API antes de cortar a los 30.
 case "$DOMINIO" in
-  catalogo) TIMEOUT_S=10 ;;
-  *)        TIMEOUT_S=15 ;;
+  catalogo)   TIMEOUT_S=10 ;;
+  reporteria) TIMEOUT_S=29; MEMORIA_MB=1024 ;;
+  *)          TIMEOUT_S=15 ;;
 esac
 
 aws_() { aws "$@" --profile "$PERFIL" --region "$REGION"; }
 
 raiz="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 zip="${raiz}/dist/${FUNCION}.zip"
+# En Git Bash (Windows) la ruta sale como /c/...; aws.exe necesita C:/... en fileb://.
+if command -v cygpath >/dev/null 2>&1; then zip="$(cygpath -m "$zip")"; fi
 
-echo "==> Construyendo ${FUNCION}"
-(cd "$raiz" && npm run build -- "$DOMINIO")
+# SIN_CONSTRUIR=1 despliega un zip ya armado en dist/ (por ejemplo, uno
+# construido en otra maquina: el build usa python3 y no corre en Windows).
+if [[ "${SIN_CONSTRUIR:-}" == "1" ]]; then
+  echo "==> Usando ${zip} sin construir"
+else
+  echo "==> Construyendo ${FUNCION}"
+  (cd "$raiz" && npm run build -- "$DOMINIO")
+fi
 [[ -f "$zip" ]] || { echo "No se genero $zip"; exit 1; }
 
 cuenta="$(aws_ sts get-caller-identity --query Account --output text)"
@@ -110,7 +121,7 @@ else
       --memory-size "$MEMORIA_MB" \
       --timeout "$TIMEOUT_S" \
       --environment "Variables={ID_SECRETO_VOAE=${SECRETO}}" \
-      --description "Datos de referencia e identidad (esquema Catalogo)" \
+      --description "Gestiones VOAE: ${FUNCION}" \
       --query 'FunctionArn' --output text 2>/dev/null; then
       break
     fi
