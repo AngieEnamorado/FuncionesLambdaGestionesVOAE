@@ -12,11 +12,17 @@ import {
   sql,
   type Parametro,
 } from "../../compartido/db";
-import { enCache } from "../../compartido/catalogos";
+import { enCache, invalidarCache } from "../../compartido/catalogos";
 import { conflicto, noEncontrado } from "../../compartido/errores";
 
 /** Cargo 2 = Coordinador. Un indice unico filtrado permite uno solo activo por grupo. */
 export const CARGO_COORDINADOR = 2;
+export const CARGO_MIEMBRO = 1;
+
+/* Horas y asistencias se cuentan solo sobre participaciones ASISTIO. Se
+   repite como subconsulta en varios lugares, asi que queda en un solo texto. */
+const ID_ESTADO_ASISTIO = `(SELECT idEstado FROM Catalogo.tblEstados
+                             WHERE contextoEstado = N'VOL_PARTICIPACION' AND codigoEstado = N'ASISTIO')`;
 
 /* ------------------------------- Estados --------------------------------
    Los estados de los tres sistemas viven en Catalogo.tblEstados, separados
@@ -60,6 +66,89 @@ export const listarCatalogos = () =>
     return { redes, trimestres, cargos, requisitos };
   });
 
+/* Las redes y trimestres se administran desde el panel. Cada escritura
+   invalida el cache de este contenedor; otros contenedores tibios pueden
+   seguir sirviendo la version anterior hasta que venza el TTL.            */
+
+export async function crearRedTematica(nombre: string, usuario: string) {
+  const fila = await consultarUna(`
+    INSERT INTO Voluntariado.tblRedesTematicas (nombreRedTematica, usuarioRegistro)
+    OUTPUT INSERTED.idRedTematica, INSERTED.nombreRedTematica
+    VALUES (@nombre, @usuario)
+  `, {
+    nombre: [sql.NVarChar(120), nombre],
+    usuario: [sql.NVarChar(90), usuario],
+  });
+  invalidarCache("catalogos");
+  return fila;
+}
+
+export async function actualizarRedTematica(idRed: number, nombre: string | null, activa: boolean | null) {
+  const fila = await consultarUna(`
+    UPDATE Voluntariado.tblRedesTematicas
+       SET nombreRedTematica = COALESCE(@nombre, nombreRedTematica),
+           estadoRedTematica = COALESCE(@activa, estadoRedTematica)
+    OUTPUT INSERTED.idRedTematica, INSERTED.nombreRedTematica, INSERTED.estadoRedTematica
+     WHERE idRedTematica = @id
+  `, {
+    nombre: [sql.NVarChar(120), nombre],
+    activa: [sql.Bit, activa],
+    id: [sql.Int, idRed],
+  });
+  invalidarCache("catalogos");
+  return fila;
+}
+
+export interface DatosTrimestre {
+  anioTrimestre: number;
+  numeroTrimestre: number;
+  fechaInicioTrimestre: string | null;
+  fechaFinTrimestre: string | null;
+  fechaLimiteInforme: string | null;
+}
+
+export async function crearTrimestre(datos: DatosTrimestre, usuario: string) {
+  const fila = await consultarUna(`
+    INSERT INTO Voluntariado.tblTrimestres
+        (anioTrimestre, numeroTrimestre, fechaInicioTrimestre, fechaFinTrimestre,
+         fechaLimiteInforme, usuarioRegistro)
+    OUTPUT INSERTED.idTrimestre
+    VALUES (@anio, @numero, @inicio, @fin, @limite, @usuario)
+  `, {
+    anio: [sql.Int, datos.anioTrimestre],
+    numero: [sql.TinyInt, datos.numeroTrimestre],
+    inicio: [sql.Date, datos.fechaInicioTrimestre],
+    fin: [sql.Date, datos.fechaFinTrimestre],
+    limite: [sql.Date, datos.fechaLimiteInforme],
+    usuario: [sql.NVarChar(90), usuario],
+  });
+  invalidarCache("catalogos");
+  return fila;
+}
+
+/** Solo las fechas son editables: anio y numero forman la llave del trimestre. */
+export async function actualizarTrimestre(
+  idTrimestre: number,
+  fechas: { inicio: string | null; fin: string | null; limite: string | null },
+) {
+  const fila = await consultarUna(`
+    UPDATE Voluntariado.tblTrimestres
+       SET fechaInicioTrimestre = COALESCE(@inicio, fechaInicioTrimestre),
+           fechaFinTrimestre = COALESCE(@fin, fechaFinTrimestre),
+           fechaLimiteInforme = COALESCE(@limite, fechaLimiteInforme)
+    OUTPUT INSERTED.idTrimestre, INSERTED.fechaInicioTrimestre, INSERTED.fechaFinTrimestre,
+           INSERTED.fechaLimiteInforme
+     WHERE idTrimestre = @id
+  `, {
+    inicio: [sql.Date, fechas.inicio],
+    fin: [sql.Date, fechas.fin],
+    limite: [sql.Date, fechas.limite],
+    id: [sql.Int, idTrimestre],
+  });
+  invalidarCache("catalogos");
+  return fila;
+}
+
 /* -------------------------------- Grupos -------------------------------- */
 
 export function listarGrupos(idCampus: number | null, idRedTematica: number | null) {
@@ -72,11 +161,22 @@ export function listarGrupos(idCampus: number | null, idRedTematica: number | nu
               FROM Voluntariado.tblGruposCampus gc
               INNER JOIN Catalogo.tblCampus c ON c.idCampus = gc.idCampus
              WHERE gc.idGrupo = g.idGrupo) AS campus,
+           (SELECT STRING_AGG(CAST(gc.idCampus AS NVARCHAR(10)), N',')
+              FROM Voluntariado.tblGruposCampus gc
+             WHERE gc.idGrupo = g.idGrupo) AS idsCampus,
            (SELECT STRING_AGG(r.nombreRedTematica, N', ')
               FROM Voluntariado.tblGruposRedesTematicas gr
               INNER JOIN Voluntariado.tblRedesTematicas r ON r.idRedTematica = gr.idRedTematica
-             WHERE gr.idGrupo = g.idGrupo) AS redesTematicas
+             WHERE gr.idGrupo = g.idGrupo) AS redesTematicas,
+           (SELECT STRING_AGG(CAST(gr.idRedTematica AS NVARCHAR(10)), N',')
+              FROM Voluntariado.tblGruposRedesTematicas gr
+             WHERE gr.idGrupo = g.idGrupo) AS idsRedesTematicas,
+           co.idPersona AS idPersonaCoordinador,
+           CONCAT(pc.nombrePersona, N' ', pc.apellidosPersona) AS nombreCoordinador
       FROM Voluntariado.tblGrupos g
+      LEFT JOIN Voluntariado.tblMiembrosGrupos co
+        ON co.idGrupo = g.idGrupo AND co.idCargo = ${CARGO_COORDINADOR} AND co.estadoMiembroGrupo = 1
+      LEFT JOIN Catalogo.tblPersonas pc ON pc.idPersona = co.idPersona
      WHERE g.estadoGrupo = 1
        AND (@idCampus IS NULL OR EXISTS (
              SELECT 1 FROM Voluntariado.tblGruposCampus gc
@@ -92,10 +192,24 @@ export function listarGrupos(idCampus: number | null, idRedTematica: number | nu
 }
 
 export async function obtenerGrupo(idGrupo: number) {
+  // tblGrupos no guarda mision, vision ni resena: viven en la solicitud que
+  // le dio origen, enlazada por idGrupoCreado. Un grupo cargado a mano, sin
+  // solicitud, simplemente no las tiene.
   const grupo = await consultarUna(`
-    SELECT idGrupo, nombreGrupo, descripcionGrupo, fechaCreacionGrupo, logoUrl,
-           redesSociales, estadoGrupo, fechaRegistro
-      FROM Voluntariado.tblGrupos WHERE idGrupo = @idGrupo
+    SELECT g.idGrupo, g.nombreGrupo, g.descripcionGrupo, g.fechaCreacionGrupo, g.logoUrl,
+           g.redesSociales, g.estadoGrupo, g.fechaRegistro,
+           s.misionGrupo, s.visionGrupo, s.resenaHistorica, s.propositoGrupo,
+           (SELECT COUNT(*) FROM Voluntariado.tblMiembrosGrupos m
+             WHERE m.idGrupo = g.idGrupo AND m.estadoMiembroGrupo = 1) AS totalMiembros,
+           (SELECT COUNT(*) FROM Voluntariado.tblActividades a
+             WHERE a.idGrupoOrganizador = g.idGrupo
+                OR EXISTS (SELECT 1 FROM Voluntariado.tblActividadesGrupos ag
+                            WHERE ag.idActividad = a.idActividad AND ag.idGrupo = g.idGrupo)) AS totalActividades,
+           (SELECT COALESCE(SUM(pa.horasParticipacion), 0) FROM Voluntariado.tblParticipaciones pa
+             WHERE pa.idGrupo = g.idGrupo AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS horasTotales
+      FROM Voluntariado.tblGrupos g
+      LEFT JOIN Voluntariado.tblSolicitudesGruposNuevos s ON s.idGrupoCreado = g.idGrupo
+     WHERE g.idGrupo = @idGrupo
   `, { idGrupo: [sql.Int, idGrupo] });
   if (!grupo) return null;
 
@@ -133,7 +247,7 @@ export const listarMiembros = (idGrupo: number, soloActivos: boolean) =>
   consultar(`
     SELECT m.idMiembroGrupo, m.idPersona, m.idCargo, c.nombreCargo, m.anioVigencia,
            m.esFundador, m.fechaIngreso, m.fechaBaja, m.estadoMiembroGrupo,
-           p.nombrePersona, p.apellidosPersona, p.correoPersona, p.idCampus,
+           p.nombrePersona, p.apellidosPersona, p.correoPersona, p.idCampus, p.sexoPersona,
            de.numeroCuenta, de.carreraEstudiante
       FROM Voluntariado.tblMiembrosGrupos m
       INNER JOIN Voluntariado.tblCargos c ON c.idCargo = m.idCargo
@@ -150,6 +264,35 @@ export const listarMiembros = (idGrupo: number, soloActivos: boolean) =>
 export const existeGrupo = async (idGrupo: number): Promise<boolean> =>
   (await consultarUna(`SELECT 1 AS hay FROM Voluntariado.tblGrupos WHERE idGrupo = @idGrupo`,
     { idGrupo: [sql.Int, idGrupo] })) !== null;
+
+/**
+ * Pasa la coordinacion a otro miembro activo. El coordinador saliente queda
+ * como Miembro. Va en ese orden dentro de la transaccion porque el indice
+ * unico filtrado no admite dos coordinadores activos ni por un instante.
+ */
+export function reasignarCoordinador(idGrupo: number, idPersona: number) {
+  return enTransaccion(async (ejecutar) => {
+    const destino = await ejecutar<{ idMiembroGrupo: number }>(`
+      SELECT idMiembroGrupo FROM Voluntariado.tblMiembrosGrupos
+       WHERE idGrupo = @idGrupo AND idPersona = @idPersona AND estadoMiembroGrupo = 1
+    `, { idGrupo: [sql.Int, idGrupo], idPersona: [sql.Int, idPersona] });
+    if (destino.length === 0) {
+      throw conflicto("Solo un miembro activo del grupo puede ser coordinador.");
+    }
+
+    await ejecutar(`
+      UPDATE Voluntariado.tblMiembrosGrupos SET idCargo = ${CARGO_MIEMBRO}
+       WHERE idGrupo = @idGrupo AND idCargo = ${CARGO_COORDINADOR} AND estadoMiembroGrupo = 1
+    `, { idGrupo: [sql.Int, idGrupo] });
+
+    await ejecutar(`
+      UPDATE Voluntariado.tblMiembrosGrupos SET idCargo = ${CARGO_COORDINADOR}
+       WHERE idMiembroGrupo = @id
+    `, { id: [sql.Int, destino[0]!.idMiembroGrupo] });
+
+    return { idGrupo, idPersonaCoordinador: idPersona };
+  });
+}
 
 /* ------------------- Solicitudes de grupos nuevos ----------------------- */
 
@@ -188,12 +331,21 @@ export async function obtenerSolicitudGrupo(id: number) {
 
   const parametro: Record<string, Parametro> = { id: [sql.Int, id] };
   const [fundadores, junta, actividades, adjuntos] = await Promise.all([
-    consultar(`SELECT idSolicitudMiembroFundador, numeroCuenta, matriculaValida
-                 FROM Voluntariado.tblSolicitudesMiembrosFundadores
-                WHERE idSolicitudGrupoNuevo = @id ORDER BY idSolicitudMiembroFundador`, parametro),
-    consultar(`SELECT j.idSolicitudJuntaDirectiva, j.numeroCuenta, j.idCargo, c.nombreCargo
+    // La solicitud guarda numeros de cuenta, no personas: el nombre sale del
+    // padron solo si la cuenta ya existe como estudiante.
+    consultar(`SELECT f.idSolicitudMiembroFundador, f.numeroCuenta, f.matriculaValida,
+                      CONCAT(p.nombrePersona, N' ', p.apellidosPersona) AS nombre,
+                      de.carreraEstudiante
+                 FROM Voluntariado.tblSolicitudesMiembrosFundadores f
+                 LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.numeroCuenta = f.numeroCuenta
+                 LEFT JOIN Catalogo.tblPersonas p ON p.idPersona = de.idPersona
+                WHERE f.idSolicitudGrupoNuevo = @id ORDER BY f.idSolicitudMiembroFundador`, parametro),
+    consultar(`SELECT j.idSolicitudJuntaDirectiva, j.numeroCuenta, j.idCargo, c.nombreCargo,
+                      CONCAT(p.nombrePersona, N' ', p.apellidosPersona) AS nombre
                  FROM Voluntariado.tblSolicitudesJuntasDirectivas j
                  INNER JOIN Voluntariado.tblCargos c ON c.idCargo = j.idCargo
+                 LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.numeroCuenta = j.numeroCuenta
+                 LEFT JOIN Catalogo.tblPersonas p ON p.idPersona = de.idPersona
                 WHERE j.idSolicitudGrupoNuevo = @id ORDER BY j.idCargo`, parametro),
     consultar(`SELECT idSolicitudActividadProyectada, nombreActividad, objetivoActividad,
                       fechaTentativa
@@ -343,6 +495,7 @@ export async function resolverSolicitudGrupo(
   idSolicitud: number,
   codigoEstado: string,
   motivo: string | null,
+  idsRedesTematicas: number[],
   usuario: string,
 ) {
   const nuevoEstado = await idEstado("VOL_SOLICITUD_GRUPO", codigoEstado);
@@ -392,6 +545,19 @@ export async function resolverSolicitudGrupo(
         idCampus: [sql.Int, solicitud.idCampus],
         usuario: [sql.NVarChar(90), usuario],
       });
+
+      // La solicitud no tiene donde guardar redes tematicas, asi que las
+      // asigna quien aprueba.
+      for (const idRed of idsRedesTematicas) {
+        await ejecutar(`
+          INSERT INTO Voluntariado.tblGruposRedesTematicas (idGrupo, idRedTematica, usuarioRegistro)
+          VALUES (@idGrupo, @idRed, @usuario)
+        `, {
+          idGrupo: [sql.Int, idGrupoCreado],
+          idRed: [sql.Int, idRed],
+          usuario: [sql.NVarChar(90), usuario],
+        });
+      }
 
       // La junta directiva pedida se vuelve membresia real. Una cuenta que
       // todavia no existe como persona no se inventa: se reporta y queda para
@@ -547,8 +713,29 @@ export function listarActividades(filtros: {
            a.idEstado, e.codigoEstado, e.nombreEstado,
            a.nombreActividad, a.objetivoActividad, a.fechaActividad, a.lugarActividad,
            a.esConjunta, a.aprobadaPorAdmin, a.fechaSolicitud, a.fechaResolucion,
+           a.resultadosActividad,
            (SELECT COUNT(*) FROM Voluntariado.tblParticipaciones pa
-             WHERE pa.idActividad = a.idActividad) AS totalParticipaciones
+             WHERE pa.idActividad = a.idActividad) AS totalParticipaciones,
+           (SELECT COUNT(*) FROM Voluntariado.tblParticipaciones pa
+              INNER JOIN Catalogo.tblEstados ep ON ep.idEstado = pa.idEstado
+             WHERE pa.idActividad = a.idActividad AND ep.codigoEstado <> N'CANCELADO') AS totalInscritos,
+           (SELECT COUNT(*) FROM Voluntariado.tblParticipaciones pa
+             WHERE pa.idActividad = a.idActividad AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS totalAsistentes,
+           (SELECT COALESCE(SUM(pa.horasParticipacion), 0) FROM Voluntariado.tblParticipaciones pa
+             WHERE pa.idActividad = a.idActividad AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS horasTotales,
+           (SELECT COUNT(*) FROM Voluntariado.tblFotosActividades f
+             WHERE f.idActividad = a.idActividad) AS totalFotos,
+           (SELECT STRING_AGG(c.nombreCampus, N', ')
+              FROM Voluntariado.tblGruposCampus gc
+              INNER JOIN Catalogo.tblCampus c ON c.idCampus = gc.idCampus
+             WHERE gc.idGrupo = a.idGrupoOrganizador) AS campus,
+           (SELECT STRING_AGG(gco.nombreGrupo, N', ')
+              FROM Voluntariado.tblActividadesGrupos ag
+              INNER JOIN Voluntariado.tblGrupos gco ON gco.idGrupo = ag.idGrupo
+             WHERE ag.idActividad = a.idActividad) AS coorganizadores,
+           (SELECT STRING_AGG(CAST(ag.idGrupo AS NVARCHAR(10)), N',')
+              FROM Voluntariado.tblActividadesGrupos ag
+             WHERE ag.idActividad = a.idActividad) AS idsCoorganizadores
       FROM Voluntariado.tblActividades a
       INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = a.idGrupoOrganizador
       INNER JOIN Voluntariado.tblTrimestres t ON t.idTrimestre = a.idTrimestre
@@ -720,7 +907,8 @@ export const listarParticipaciones = (idActividad: number) =>
            pa.fechaInscripcion, pa.fechaConfirmacion, pa.idPersonaConfirma,
            pa.validadoComoMiembro, pa.validadoMismoCampus,
            COALESCE(pa.nombreSnapshot, CONCAT(p.nombrePersona, N' ', p.apellidosPersona)) AS nombre,
-           de.numeroCuenta
+           COALESCE(pa.sexoSnapshot, p.sexoPersona) AS sexo,
+           de.numeroCuenta, de.carreraEstudiante
       FROM Voluntariado.tblParticipaciones pa
       INNER JOIN Catalogo.tblEstados e ON e.idEstado = pa.idEstado
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = pa.idPersona
@@ -753,6 +941,8 @@ export async function registrarAsistencia(
   for (const codigo of new Set(lineas.map((l) => l.codigoEstado))) {
     estados.set(codigo, await idEstado("VOL_PARTICIPACION", codigo));
   }
+  const estadoAprobada = await idEstado("VOL_ACTIVIDAD", "APROBADA");
+  const estadoEjecutada = await idEstado("VOL_ACTIVIDAD", "EJECUTADA");
 
   return enTransaccion(async (ejecutar) => {
     let insertadas = 0;
@@ -803,8 +993,126 @@ export async function registrarAsistencia(
       }
     }
 
+    // Pasar lista es la constancia de que la actividad ocurrio: una aprobada
+    // pasa a ejecutada en la misma transaccion. Es la segunda regla que vive
+    // aqui y no en la base (ver resolverSolicitudGrupo); sin ella ninguna
+    // actividad contaria para el porcentaje de diploma, que solo mira las
+    // EJECUTADA. Candidata a trigger sobre tblParticipaciones.
+    await ejecutar(`
+      UPDATE Voluntariado.tblActividades SET idEstado = @ejecutada
+       WHERE idActividad = @idActividad AND idEstado = @aprobada
+    `, {
+      ejecutada: [sql.Int, estadoEjecutada],
+      aprobada: [sql.Int, estadoAprobada],
+      idActividad: [sql.Int, idActividad],
+    });
+
     return { idActividad, insertadas, actualizadas };
   });
+}
+
+/**
+ * Inscripcion del estudiante. Entra como VOLUNTARIO_ACTIVO por el grupo al
+ * que pertenece si es miembro del organizador o de un coorganizador; si no,
+ * como ESTUDIANTE_PARTICIPANTE bajo el grupo organizador. Una inscripcion
+ * cancelada antes se reactiva en lugar de duplicarse.
+ */
+export async function inscribirEnActividad(idActividad: number, idPersona: number, usuario: string) {
+  const [estadoInscrito, estadoAprobada] = await Promise.all([
+    idEstado("VOL_PARTICIPACION", "INSCRITO"),
+    idEstado("VOL_ACTIVIDAD", "APROBADA"),
+  ]);
+
+  return enTransaccion(async (ejecutar) => {
+    const actividades = await ejecutar<{ idGrupoOrganizador: number; idPeriodo: number; idEstado: number }>(`
+      SELECT idGrupoOrganizador, idPeriodo, idEstado FROM Voluntariado.tblActividades
+       WHERE idActividad = @id
+    `, { id: [sql.Int, idActividad] });
+    const actividad = actividades[0];
+    if (!actividad) throw noEncontrado(`No existe la actividad ${idActividad}.`);
+    if (actividad.idEstado !== estadoAprobada) {
+      throw conflicto("Solo se puede inscribir en actividades aprobadas que aun no se ejecutan.");
+    }
+
+    const membresias = await ejecutar<{ idGrupo: number }>(`
+      SELECT m.idGrupo
+        FROM Voluntariado.tblMiembrosGrupos m
+       WHERE m.idPersona = @idPersona AND m.estadoMiembroGrupo = 1
+         AND (m.idGrupo = @idOrganizador
+              OR m.idGrupo IN (SELECT idGrupo FROM Voluntariado.tblActividadesGrupos
+                                WHERE idActividad = @idActividad))
+       ORDER BY CASE WHEN m.idGrupo = @idOrganizador THEN 0 ELSE 1 END
+    `, {
+      idPersona: [sql.Int, idPersona],
+      idOrganizador: [sql.Int, actividad.idGrupoOrganizador],
+      idActividad: [sql.Int, idActividad],
+    });
+
+    const esMiembro = membresias.length > 0;
+    const idGrupo = esMiembro ? membresias[0]!.idGrupo : actividad.idGrupoOrganizador;
+    const tipoParticipante = esMiembro ? "VOLUNTARIO_ACTIVO" : "ESTUDIANTE_PARTICIPANTE";
+    const parametros: Record<string, Parametro> = {
+      idActividad: [sql.Int, idActividad],
+      idGrupo: [sql.Int, idGrupo],
+      idPersona: [sql.Int, idPersona],
+      idPeriodo: [sql.Int, actividad.idPeriodo],
+      idEstado: [sql.Int, estadoInscrito],
+      tipo: [sql.NVarChar(25), tipoParticipante],
+      esMiembro: [sql.Bit, esMiembro],
+      usuario: [sql.NVarChar(90), usuario],
+    };
+
+    const previas = await ejecutar<{ idParticipacion: number }>(`
+      SELECT idParticipacion FROM Voluntariado.tblParticipaciones
+       WHERE idActividad = @idActividad AND idPersona = @idPersona
+    `, parametros);
+
+    if (previas.length > 0) {
+      await ejecutar(`
+        UPDATE Voluntariado.tblParticipaciones
+           SET idEstado = @idEstado, tipoParticipante = @tipo, validadoComoMiembro = @esMiembro,
+               horasParticipacion = NULL, fechaInscripcion = SYSDATETIME()
+         WHERE idActividad = @idActividad AND idPersona = @idPersona
+      `, parametros);
+    } else {
+      await ejecutar(`
+        INSERT INTO Voluntariado.tblParticipaciones
+            (idActividad, idGrupo, idPersona, idPeriodo, idEstado, tipoParticipante,
+             nombreSnapshot, sexoSnapshot, validadoComoMiembro, validadoMismoCampus, usuarioRegistro)
+        SELECT @idActividad, @idGrupo, @idPersona, @idPeriodo, @idEstado, @tipo,
+               CONCAT(p.nombrePersona, N' ', p.apellidosPersona), p.sexoPersona, @esMiembro,
+               CASE WHEN EXISTS (SELECT 1 FROM Voluntariado.tblGruposCampus gc
+                                  WHERE gc.idGrupo = @idGrupo AND gc.idCampus = p.idCampus)
+                    THEN 1 ELSE 0 END,
+               @usuario
+          FROM Catalogo.tblPersonas p
+         WHERE p.idPersona = @idPersona
+      `, parametros);
+    }
+
+    return { idActividad, idPersona, idGrupo, tipoParticipante };
+  });
+}
+
+/** Cancelar solo aplica mientras la persona sigue INSCRITA; una asistencia ya confirmada no se deshace. */
+export async function cancelarInscripcion(idActividad: number, idPersona: number) {
+  const [estadoInscrito, estadoCancelado] = await Promise.all([
+    idEstado("VOL_PARTICIPACION", "INSCRITO"),
+    idEstado("VOL_PARTICIPACION", "CANCELADO"),
+  ]);
+  // Sin OUTPUT: la tabla tiene trigger y SQL Server no admite OUTPUT sin INTO sobre ella.
+  const fila = await consultarUna<{ filas: number }>(`
+    UPDATE Voluntariado.tblParticipaciones SET idEstado = @cancelado
+     WHERE idActividad = @idActividad AND idPersona = @idPersona AND idEstado = @inscrito;
+    SELECT @@ROWCOUNT AS filas;
+  `, {
+    cancelado: [sql.Int, estadoCancelado],
+    inscrito: [sql.Int, estadoInscrito],
+    idActividad: [sql.Int, idActividad],
+    idPersona: [sql.Int, idPersona],
+  });
+  if (!fila?.filas) throw conflicto("No hay una inscripcion vigente que cancelar.");
+  return { idActividad, idPersona, estado: "CANCELADO" };
 }
 
 /* --------------------------- Informes trimestrales ---------------------- */
@@ -820,7 +1128,21 @@ export const listarInformes = (
            i.idEstado, e.codigoEstado, e.nombreEstado, i.fechaEnvio,
            i.observacionesAdmin, i.fechaRegistro,
            (SELECT COUNT(*) FROM Voluntariado.tblInformesTrimestralesActividades ia
-             WHERE ia.idInformeTrimestral = i.idInformeTrimestral) AS totalActividades
+             WHERE ia.idInformeTrimestral = i.idInformeTrimestral) AS totalActividades,
+           (SELECT COUNT(DISTINCT pa.idPersona)
+              FROM Voluntariado.tblInformesTrimestralesActividades ia
+              INNER JOIN Voluntariado.tblParticipaciones pa ON pa.idActividad = ia.idActividad
+             WHERE ia.idInformeTrimestral = i.idInformeTrimestral
+               AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS totalParticipantes,
+           (SELECT COALESCE(SUM(pa.horasParticipacion), 0)
+              FROM Voluntariado.tblInformesTrimestralesActividades ia
+              INNER JOIN Voluntariado.tblParticipaciones pa ON pa.idActividad = ia.idActividad
+             WHERE ia.idInformeTrimestral = i.idInformeTrimestral
+               AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS horasTotales,
+           (SELECT STRING_AGG(c.nombreCampus, N', ')
+              FROM Voluntariado.tblGruposCampus gc
+              INNER JOIN Catalogo.tblCampus c ON c.idCampus = gc.idCampus
+             WHERE gc.idGrupo = i.idGrupo) AS campus
       FROM Voluntariado.tblInformesTrimestrales i
       INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = i.idGrupo
       INNER JOIN Voluntariado.tblTrimestres t ON t.idTrimestre = i.idTrimestre
@@ -852,9 +1174,10 @@ export async function obtenerInforme(idInforme: number) {
            a.fechaActividad, a.lugarActividad, e.codigoEstado,
            (SELECT COUNT(*) FROM Voluntariado.tblParticipaciones pa
              WHERE pa.idActividad = a.idActividad
-               AND pa.idEstado = (SELECT idEstado FROM Catalogo.tblEstados
-                                   WHERE contextoEstado = N'VOL_PARTICIPACION'
-                                     AND codigoEstado = N'ASISTIO')) AS asistentes
+               AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS asistentes,
+           (SELECT COALESCE(SUM(pa.horasParticipacion), 0) FROM Voluntariado.tblParticipaciones pa
+             WHERE pa.idActividad = a.idActividad
+               AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS horas
       FROM Voluntariado.tblInformesTrimestralesActividades ia
       INNER JOIN Voluntariado.tblActividades a ON a.idActividad = ia.idActividad
       INNER JOIN Catalogo.tblEstados e ON e.idEstado = a.idEstado
@@ -862,7 +1185,14 @@ export async function obtenerInforme(idInforme: number) {
      ORDER BY a.fechaActividad
   `, { id: [sql.Int, idInforme] });
 
-  return { ...informe, actividades };
+  const [totales] = await consultar<{ totalParticipantes: number }>(`
+    SELECT COUNT(DISTINCT pa.idPersona) AS totalParticipantes
+      FROM Voluntariado.tblInformesTrimestralesActividades ia
+      INNER JOIN Voluntariado.tblParticipaciones pa ON pa.idActividad = ia.idActividad
+     WHERE ia.idInformeTrimestral = @id AND pa.idEstado = ${ID_ESTADO_ASISTIO}
+  `, { id: [sql.Int, idInforme] });
+
+  return { ...informe, totalParticipantes: totales?.totalParticipantes ?? 0, actividades };
 }
 
 export async function crearInforme(idGrupo: number, idTrimestre: number, usuario: string) {
@@ -1220,6 +1550,268 @@ export const listarDiplomas = (idGrupo: number) =>
      WHERE d.idGrupo = @idGrupo
      ORDER BY d.fechaEmision DESC
   `, { idGrupo: [sql.Int, idGrupo] });
+
+/**
+ * Porcentaje de participacion de cada miembro activo, elegible o no. Misma
+ * cuenta que listarElegiblesDiploma (ejecutadas del grupo como denominador,
+ * ASISTIO como numerador), pero sin filtrar por umbral y opcionalmente para
+ * todos los grupos: es la vista del panel de diplomas.
+ */
+export const listarParticipacionMiembros = (idGrupo: number | null, idTrimestre: number | null) =>
+  consultar(`
+    WITH ejecutadas AS (
+        SELECT g.idGrupo, a.idActividad
+          FROM Voluntariado.tblGrupos g
+          INNER JOIN Voluntariado.tblActividades a
+             ON a.idGrupoOrganizador = g.idGrupo
+             OR EXISTS (SELECT 1 FROM Voluntariado.tblActividadesGrupos ag
+                         WHERE ag.idActividad = a.idActividad AND ag.idGrupo = g.idGrupo)
+          INNER JOIN Catalogo.tblEstados e ON e.idEstado = a.idEstado
+         WHERE e.contextoEstado = N'VOL_ACTIVIDAD' AND e.codigoEstado = N'EJECUTADA'
+           AND (@idTrimestre IS NULL OR a.idTrimestre = @idTrimestre)
+    ),
+    base AS (
+        SELECT m.idGrupo, g.nombreGrupo, m.idPersona,
+               CONCAT(p.nombrePersona, N' ', p.apellidosPersona) AS nombre,
+               de.numeroCuenta,
+               (SELECT STRING_AGG(c.nombreCampus, N', ')
+                  FROM Voluntariado.tblGruposCampus gc
+                  INNER JOIN Catalogo.tblCampus c ON c.idCampus = gc.idCampus
+                 WHERE gc.idGrupo = m.idGrupo) AS campus,
+               (SELECT COUNT(*) FROM ejecutadas x WHERE x.idGrupo = m.idGrupo) AS actividadesGrupo,
+               (SELECT COUNT(*) FROM ejecutadas x
+                  INNER JOIN Voluntariado.tblParticipaciones pa
+                     ON pa.idActividad = x.idActividad AND pa.idPersona = m.idPersona
+                 WHERE x.idGrupo = m.idGrupo AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS actividadesAsistidas,
+               (SELECT COALESCE(SUM(pa.horasParticipacion), 0) FROM ejecutadas x
+                  INNER JOIN Voluntariado.tblParticipaciones pa
+                     ON pa.idActividad = x.idActividad AND pa.idPersona = m.idPersona
+                 WHERE x.idGrupo = m.idGrupo AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS horasConfirmadas,
+               CASE WHEN EXISTS (SELECT 1 FROM Voluntariado.tblDiplomas d
+                                  WHERE d.idGrupo = m.idGrupo AND d.idPersona = m.idPersona)
+                    THEN 1 ELSE 0 END AS yaTieneDiploma
+          FROM Voluntariado.tblMiembrosGrupos m
+          INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = m.idGrupo
+          INNER JOIN Catalogo.tblPersonas p ON p.idPersona = m.idPersona
+          LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = m.idPersona
+         WHERE m.estadoMiembroGrupo = 1 AND g.estadoGrupo = 1
+           AND (@idGrupo IS NULL OR m.idGrupo = @idGrupo)
+    )
+    SELECT base.*,
+           CAST(COALESCE(100.0 * actividadesAsistidas / NULLIF(actividadesGrupo, 0), 0) AS DECIMAL(5,2))
+             AS porcentajeParticipacion
+      FROM base
+     ORDER BY nombreGrupo, porcentajeParticipacion DESC, nombre
+  `, {
+    idGrupo: [sql.Int, idGrupo],
+    idTrimestre: [sql.Int, idTrimestre],
+  });
+
+/* ------------------------------- Personas -------------------------------
+   Sin capa de sesion, el portal del estudiante pregunta por una persona
+   explicita. Estas consultas son las que arman "mi" vista: mis grupos, mis
+   horas, mis inscripciones y mis solicitudes.                             */
+
+/** Estudiantes con alguna relacion con Voluntariado: alimenta el selector de persona de prueba. */
+export const listarPersonasVoluntariado = () =>
+  consultar(`
+    SELECT p.idPersona, p.nombrePersona, p.apellidosPersona, de.numeroCuenta, de.carreraEstudiante,
+           (SELECT STRING_AGG(g.nombreGrupo, N', ')
+              FROM Voluntariado.tblMiembrosGrupos m
+              INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = m.idGrupo
+             WHERE m.idPersona = p.idPersona AND m.estadoMiembroGrupo = 1) AS grupos,
+           CASE WHEN EXISTS (SELECT 1 FROM Voluntariado.tblMiembrosGrupos m
+                              WHERE m.idPersona = p.idPersona AND m.estadoMiembroGrupo = 1
+                                AND m.idCargo = ${CARGO_COORDINADOR})
+                THEN 1 ELSE 0 END AS esCoordinador
+      FROM Catalogo.tblPersonas p
+      INNER JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = p.idPersona
+     WHERE EXISTS (SELECT 1 FROM Voluntariado.tblMiembrosGrupos m WHERE m.idPersona = p.idPersona)
+        OR EXISTS (SELECT 1 FROM Voluntariado.tblParticipaciones pa WHERE pa.idPersona = p.idPersona)
+        OR EXISTS (SELECT 1 FROM Voluntariado.tblSolicitudesUniones su WHERE su.idPersona = p.idPersona)
+        OR EXISTS (SELECT 1 FROM Voluntariado.tblSolicitudesGruposNuevos s
+                    WHERE s.idPersonaSolicitante = p.idPersona)
+     ORDER BY esCoordinador DESC, p.nombrePersona, p.apellidosPersona
+  `);
+
+export async function obtenerResumenPersona(idPersona: number) {
+  const persona = await consultarUna(`
+    SELECT p.idPersona, p.nombrePersona, p.apellidosPersona, p.correoPersona, p.sexoPersona,
+           p.idCampus, c.nombreCampus, de.numeroCuenta, de.carreraEstudiante,
+           (SELECT COALESCE(SUM(pa.horasParticipacion), 0) FROM Voluntariado.tblParticipaciones pa
+             WHERE pa.idPersona = p.idPersona AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS horasConfirmadas
+      FROM Catalogo.tblPersonas p
+      LEFT JOIN Catalogo.tblCampus c ON c.idCampus = p.idCampus
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = p.idPersona
+     WHERE p.idPersona = @idPersona
+  `, { idPersona: [sql.Int, idPersona] });
+  if (!persona) return null;
+
+  const grupos = await consultar(`
+    SELECT m.idGrupo, g.nombreGrupo, m.idCargo, c.nombreCargo, m.esFundador, m.fechaIngreso,
+           CASE WHEN m.idCargo = ${CARGO_COORDINADOR} THEN 1 ELSE 0 END AS esCoordinador,
+           (SELECT STRING_AGG(ca.nombreCampus, N', ')
+              FROM Voluntariado.tblGruposCampus gc
+              INNER JOIN Catalogo.tblCampus ca ON ca.idCampus = gc.idCampus
+             WHERE gc.idGrupo = m.idGrupo) AS campus
+      FROM Voluntariado.tblMiembrosGrupos m
+      INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = m.idGrupo
+      INNER JOIN Voluntariado.tblCargos c ON c.idCargo = m.idCargo
+     WHERE m.idPersona = @idPersona AND m.estadoMiembroGrupo = 1 AND g.estadoGrupo = 1
+     ORDER BY esCoordinador DESC, g.nombreGrupo
+  `, { idPersona: [sql.Int, idPersona] });
+
+  return { ...persona, grupos };
+}
+
+export const listarParticipacionesPersona = (idPersona: number) =>
+  consultar(`
+    SELECT pa.idParticipacion, pa.idActividad, a.nombreActividad, a.fechaActividad, a.lugarActividad,
+           ea.codigoEstado AS codigoEstadoActividad, a.idGrupoOrganizador,
+           go.nombreGrupo AS nombreGrupoOrganizador, pa.idGrupo, g.nombreGrupo,
+           e.codigoEstado, e.nombreEstado, pa.tipoParticipante, pa.horasParticipacion,
+           pa.fechaInscripcion, pa.fechaConfirmacion
+      FROM Voluntariado.tblParticipaciones pa
+      INNER JOIN Voluntariado.tblActividades a ON a.idActividad = pa.idActividad
+      INNER JOIN Catalogo.tblEstados ea ON ea.idEstado = a.idEstado
+      INNER JOIN Catalogo.tblEstados e ON e.idEstado = pa.idEstado
+      INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = pa.idGrupo
+      INNER JOIN Voluntariado.tblGrupos go ON go.idGrupo = a.idGrupoOrganizador
+     WHERE pa.idPersona = @idPersona
+     ORDER BY a.fechaActividad DESC, pa.idParticipacion DESC
+  `, { idPersona: [sql.Int, idPersona] });
+
+/**
+ * Todo lo que la persona tiene en tramite, en una sola lista: uniones que
+ * pidio, grupos que propuso y las actividades de los grupos que coordina.
+ */
+export const listarSolicitudesPersona = (idPersona: number) =>
+  consultar(`
+    SELECT N'UNION' AS tipo, su.idSolicitudUnion AS id,
+           CONCAT(N'Unión a ', g.nombreGrupo) AS titulo, su.idGrupo,
+           e.codigoEstado, e.nombreEstado, su.fechaSolicitud AS fecha,
+           su.motivoResolucion AS motivo
+      FROM Voluntariado.tblSolicitudesUniones su
+      INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = su.idGrupo
+      INNER JOIN Catalogo.tblEstados e ON e.idEstado = su.idEstado
+     WHERE su.idPersona = @idPersona
+    UNION ALL
+    SELECT N'GRUPO', s.idSolicitudGrupoNuevo, CONCAT(N'Creación de ', s.nombreGrupo), s.idGrupoCreado,
+           e.codigoEstado, e.nombreEstado, s.fechaSolicitud, s.motivoResolucion
+      FROM Voluntariado.tblSolicitudesGruposNuevos s
+      INNER JOIN Catalogo.tblEstados e ON e.idEstado = s.idEstado
+     WHERE s.idPersonaSolicitante = @idPersona
+    UNION ALL
+    SELECT N'ACTIVIDAD', a.idActividad, a.nombreActividad, a.idGrupoOrganizador,
+           e.codigoEstado, e.nombreEstado, a.fechaSolicitud, NULL
+      FROM Voluntariado.tblActividades a
+      INNER JOIN Catalogo.tblEstados e ON e.idEstado = a.idEstado
+     WHERE a.idGrupoOrganizador IN (SELECT m.idGrupo FROM Voluntariado.tblMiembrosGrupos m
+                                     WHERE m.idPersona = @idPersona AND m.estadoMiembroGrupo = 1
+                                       AND m.idCargo = ${CARGO_COORDINADOR})
+     ORDER BY fecha DESC
+  `, { idPersona: [sql.Int, idPersona] });
+
+/* ------------------------- Tablero y estadisticas -----------------------
+   Viven aqui de forma provisional: segun el diseno pertenecen a
+   voae-reporteria, que aun no existe. Se mudan tal cual cuando exista.   */
+
+/** Trimestre vigente: el que contiene la fecha de hoy, o el ultimo que ya empezo. */
+const TRIMESTRE_VIGENTE = `
+    SELECT TOP 1 idTrimestre, anioTrimestre, numeroTrimestre, fechaLimiteInforme
+      FROM Voluntariado.tblTrimestres
+     WHERE estadoTrimestre = 1
+       AND (fechaInicioTrimestre IS NULL OR fechaInicioTrimestre <= CAST(SYSDATETIME() AS DATE))
+     ORDER BY anioTrimestre DESC, numeroTrimestre DESC`;
+
+export async function obtenerTablero() {
+  const [totales, porCampus, porRed, trimestre] = await Promise.all([
+    consultarUna(`
+      SELECT (SELECT COUNT(*) FROM Voluntariado.tblGrupos WHERE estadoGrupo = 1) AS grupos,
+             (SELECT COUNT(*) FROM Voluntariado.tblActividades) AS actividades,
+             (SELECT COUNT(DISTINCT idPersona) FROM Voluntariado.tblParticipaciones
+               WHERE idEstado = ${ID_ESTADO_ASISTIO}) AS participantes,
+             (SELECT COALESCE(SUM(horasParticipacion), 0) FROM Voluntariado.tblParticipaciones
+               WHERE idEstado = ${ID_ESTADO_ASISTIO}) AS horas
+    `),
+    // El semaforo se evalua sobre el trimestre vigente: entregado si todos
+    // los grupos del campus enviaron, atrasado si ya paso la fecha limite.
+    consultar(`
+      WITH vigente AS (${TRIMESTRE_VIGENTE}),
+      porCampus AS (
+          SELECT c.idCampus, c.nombreCampus,
+                 COUNT(DISTINCT gc.idGrupo) AS grupos,
+                 (SELECT COUNT(DISTINCT pa.idPersona) FROM Voluntariado.tblParticipaciones pa
+                   WHERE pa.idEstado = ${ID_ESTADO_ASISTIO}
+                     AND pa.idGrupo IN (SELECT idGrupo FROM Voluntariado.tblGruposCampus
+                                         WHERE idCampus = c.idCampus)) AS participantes,
+                 (SELECT COALESCE(SUM(pa.horasParticipacion), 0) FROM Voluntariado.tblParticipaciones pa
+                   WHERE pa.idEstado = ${ID_ESTADO_ASISTIO}
+                     AND pa.idGrupo IN (SELECT idGrupo FROM Voluntariado.tblGruposCampus
+                                         WHERE idCampus = c.idCampus)) AS horas,
+                 (SELECT COUNT(*) FROM Voluntariado.tblInformesTrimestrales i
+                   INNER JOIN Catalogo.tblEstados e ON e.idEstado = i.idEstado
+                   WHERE i.idTrimestre = (SELECT idTrimestre FROM vigente)
+                     AND e.codigoEstado IN (N'ENVIADO', N'ACEPTADO')
+                     AND i.idGrupo IN (SELECT idGrupo FROM Voluntariado.tblGruposCampus
+                                        WHERE idCampus = c.idCampus)) AS informesEntregados
+            FROM Catalogo.tblCampus c
+            INNER JOIN Voluntariado.tblGruposCampus gc ON gc.idCampus = c.idCampus
+            INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = gc.idGrupo AND g.estadoGrupo = 1
+           GROUP BY c.idCampus, c.nombreCampus
+      )
+      SELECT porCampus.*,
+             CASE WHEN informesEntregados >= grupos THEN N'Entregado'
+                  WHEN (SELECT fechaLimiteInforme FROM vigente) < CAST(SYSDATETIME() AS DATE) THEN N'Atrasado'
+                  ELSE N'Por vencer' END AS semaforo
+        FROM porCampus
+       ORDER BY nombreCampus
+    `),
+    consultar(`
+      SELECT r.idRedTematica, r.nombreRedTematica,
+             (SELECT COUNT(*) FROM Voluntariado.tblGruposRedesTematicas gr
+               WHERE gr.idRedTematica = r.idRedTematica) AS grupos,
+             (SELECT COALESCE(SUM(pa.horasParticipacion), 0) FROM Voluntariado.tblParticipaciones pa
+               WHERE pa.idEstado = ${ID_ESTADO_ASISTIO}
+                 AND pa.idGrupo IN (SELECT idGrupo FROM Voluntariado.tblGruposRedesTematicas
+                                     WHERE idRedTematica = r.idRedTematica)) AS horas
+        FROM Voluntariado.tblRedesTematicas r
+       WHERE r.estadoRedTematica = 1
+       ORDER BY r.nombreRedTematica
+    `),
+    consultarUna(TRIMESTRE_VIGENTE),
+  ]);
+
+  return { totales, trimestreVigente: trimestre, porCampus, porRed };
+}
+
+/**
+ * Una fila por actividad, sin agregar: el panel filtra y suma en el cliente.
+ * Devolver la unidad y no totales precocinados evita que dos graficos del
+ * mismo panel cuenten distinto. Campus y red son los primeros del grupo
+ * organizador, en orden alfabetico.
+ */
+export const listarEstadisticas = () =>
+  consultar(`
+    SELECT a.idActividad, a.fechaActividad AS fecha, per.anioPeriodo, per.numeroPac,
+           (SELECT TOP 1 c.nombreCampus FROM Voluntariado.tblGruposCampus gc
+              INNER JOIN Catalogo.tblCampus c ON c.idCampus = gc.idCampus
+             WHERE gc.idGrupo = a.idGrupoOrganizador ORDER BY c.nombreCampus) AS campus,
+           (SELECT TOP 1 r.idRedTematica FROM Voluntariado.tblGruposRedesTematicas gr
+              INNER JOIN Voluntariado.tblRedesTematicas r ON r.idRedTematica = gr.idRedTematica
+             WHERE gr.idGrupo = a.idGrupoOrganizador ORDER BY r.nombreRedTematica) AS idRedTematica,
+           g.nombreGrupo AS grupo, e.codigoEstado AS estado, e.nombreEstado,
+           (SELECT COUNT(*) FROM Voluntariado.tblParticipaciones pa
+             WHERE pa.idActividad = a.idActividad AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS participantes,
+           (SELECT COALESCE(SUM(pa.horasParticipacion), 0) FROM Voluntariado.tblParticipaciones pa
+             WHERE pa.idActividad = a.idActividad AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS horas
+      FROM Voluntariado.tblActividades a
+      INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = a.idGrupoOrganizador
+      INNER JOIN Catalogo.tblEstados e ON e.idEstado = a.idEstado
+      INNER JOIN Catalogo.tblPeriodos per ON per.idPeriodo = a.idPeriodo
+     WHERE a.fechaActividad IS NOT NULL
+     ORDER BY a.fechaActividad
+  `);
 
 /* ------------------------------- Diagnostico ---------------------------- */
 
