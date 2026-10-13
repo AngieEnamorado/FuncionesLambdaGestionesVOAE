@@ -29,6 +29,9 @@ export const router = crearRouter("/v1/voluntariado");
 const PREFIJO_ARCHIVOS = {
   SOLICITUD_GRUPO: (id: number) => `voluntariado/solicitudes-grupos/${id}/`,
   ACTIVIDAD: (id: number) => `voluntariado/actividades/${id}/`,
+  // Facturas, recibos y transferencias del informe economico: cuelgan de la
+  // actividad, en su propia carpeta para no mezclarse con la evidencia.
+  COMPROBANTE: (id: number) => `voluntariado/actividades/${id}/comprobantes/`,
 } as const;
 
 /** Agrega urlDescarga (firmada, de vida corta) a cada fila que trae archivoUrl. */
@@ -452,8 +455,27 @@ router.get("/actividades/{id}/economico", async ({ parametros }) => {
   const id = enteroRequerido(parametros["id"], "id");
   const informe = await consultas.obtenerInformeEconomico(id);
   if (!informe) throw noEncontrado(`La actividad ${id} no tiene informe economico.`);
-  return informe;
+  const movimientos = await Promise.all(
+    (informe.movimientos as { comprobanteUrl: string | null }[]).map(async (m) => ({
+      ...m,
+      urlComprobante: await urlDeDescarga(m.comprobanteUrl),
+    })),
+  );
+  return { ...informe, movimientos };
 });
+
+/* Todo movimiento que declara un comprobante (factura, recibo, transferencia)
+   tiene que traer la foto o el PDF de ese comprobante. Sin tipo de
+   comprobante no se exige archivo. */
+function comprobanteDe(movimiento: Record<string, unknown>, indice: number, idActividad: number): string | null {
+  const tipo = textoOpcional(movimiento["tipoComprobante"], `movimientos[${indice}].tipoComprobante`, 30);
+  const llave = textoOpcional(movimiento["comprobanteUrl"], `movimientos[${indice}].comprobanteUrl`, 300);
+  if (tipo && !llave) {
+    throw solicitudInvalida(`El movimiento ${indice + 1} dice ${tipo} pero no tiene el archivo del comprobante.`);
+  }
+  if (llave) exigirLlaveDe(llave, PREFIJO_ARCHIVOS.ACTIVIDAD(idActividad));
+  return llave;
+}
 
 router.put("/actividades/{id}/economico", async ({ parametros, cuerpo, usuarioRegistro }) => {
   const idActividad = enteroRequerido(parametros["id"], "id");
@@ -482,7 +504,7 @@ router.put("/actividades/{id}/economico", async ({ parametros, cuerpo, usuarioRe
       cantidadMovimiento: movimiento["cantidadMovimiento"] == null ? null : Number(movimiento["cantidadMovimiento"]),
       valorUnitario: movimiento["valorUnitario"] == null ? null : Number(movimiento["valorUnitario"]),
       montoMovimiento: monto,
-      comprobanteUrl: textoOpcional(movimiento["comprobanteUrl"], `movimientos[${indice}].comprobanteUrl`, 300),
+      comprobanteUrl: comprobanteDe(movimiento, indice, idActividad),
     };
   });
 
@@ -584,14 +606,15 @@ router.get("/estadisticas", async () => reporteria.listarEstadisticas());
 
 router.post("/archivos/subidas", async ({ cuerpo }) => {
   const proceso = textoRequerido(cuerpo["proceso"], "proceso", 30).toUpperCase();
-  if (proceso !== "SOLICITUD_GRUPO" && proceso !== "ACTIVIDAD") {
-    throw solicitudInvalida("proceso debe ser SOLICITUD_GRUPO o ACTIVIDAD.");
+  if (proceso !== "SOLICITUD_GRUPO" && proceso !== "ACTIVIDAD" && proceso !== "COMPROBANTE") {
+    throw solicitudInvalida("proceso debe ser SOLICITUD_GRUPO, ACTIVIDAD o COMPROBANTE.");
   }
   const idReferencia = enteroRequerido(cuerpo["idReferencia"], "idReferencia");
-  const existe = proceso === "ACTIVIDAD"
+  const esActividad = proceso === "ACTIVIDAD" || proceso === "COMPROBANTE";
+  const existe = esActividad
     ? await consultas.obtenerActividad(idReferencia)
     : await consultas.obtenerSolicitudGrupo(idReferencia);
-  if (!existe) throw noEncontrado(`No existe ${proceso === "ACTIVIDAD" ? "la actividad" : "la solicitud"} ${idReferencia}.`);
+  if (!existe) throw noEncontrado(`No existe ${esActividad ? "la actividad" : "la solicitud"} ${idReferencia}.`);
 
   return creado(await firmarSubida(
     PREFIJO_ARCHIVOS[proceso](idReferencia),
