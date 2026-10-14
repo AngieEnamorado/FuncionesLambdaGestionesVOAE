@@ -32,6 +32,7 @@ const PREFIJO_ARCHIVOS = {
   // Facturas, recibos y transferencias del informe economico: cuelgan de la
   // actividad, en su propia carpeta para no mezclarse con la evidencia.
   COMPROBANTE: (id: number) => `voluntariado/actividades/${id}/comprobantes/`,
+  GRUPO: (id: number) => `voluntariado/grupos/${id}/`,
 } as const;
 
 /** Agrega urlDescarga (firmada, de vida corta) a cada fila que trae archivoUrl. */
@@ -126,7 +127,37 @@ router.get("/grupos/{idGrupo}", async ({ parametros }) => {
   const idGrupo = enteroRequerido(parametros["idGrupo"], "idGrupo");
   const grupo = await consultas.obtenerGrupo(idGrupo);
   if (!grupo) throw noEncontrado(`No existe el grupo ${idGrupo}.`);
-  return grupo;
+  return { ...grupo, urlLogo: await urlDeDescarga(grupo.logoUrl) };
+});
+
+/* Edicion por la VOAE. Cambios parciales: solo se toca lo que viene en el
+   cuerpo. Mandar null en un texto lo borra. */
+router.put("/grupos/{idGrupo}", async ({ parametros, cuerpo, usuarioRegistro }) => {
+  const idGrupo = enteroRequerido(parametros["idGrupo"], "idGrupo");
+  await exigirGrupo(idGrupo);
+  if ("nombreGrupo" in cuerpo) {
+    throw solicitudInvalida("El nombre del grupo no se puede cambiar.");
+  }
+
+  const cambios: consultas.CambiosGrupo = {};
+  if ("descripcionGrupo" in cuerpo) cambios.descripcionGrupo = textoOpcional(cuerpo["descripcionGrupo"], "descripcionGrupo", 4000);
+  if ("redesSociales" in cuerpo) cambios.redesSociales = textoOpcional(cuerpo["redesSociales"], "redesSociales", 300);
+  if ("logoUrl" in cuerpo) {
+    const llave = textoOpcional(cuerpo["logoUrl"], "logoUrl", 300);
+    if (llave) exigirLlaveDe(llave, PREFIJO_ARCHIVOS.GRUPO(idGrupo));
+    cambios.logoUrl = llave;
+  }
+  if ("redesTematicas" in cuerpo) {
+    const redes = lista(cuerpo["redesTematicas"], "redesTematicas").map((id, i) => enteroRequerido(id, `redesTematicas[${i}]`));
+    if (redes.length === 0) throw solicitudInvalida("El grupo debe pertenecer al menos a una red tematica.");
+    cambios.redesTematicas = redes;
+  }
+  if (Object.keys(cambios).length === 0) {
+    throw solicitudInvalida("No hay nada que cambiar: manda descripcionGrupo, redesSociales, logoUrl o redesTematicas.");
+  }
+
+  const grupo = await consultas.editarGrupo(idGrupo, cambios, usuarioRegistro);
+  return { ...grupo, urlLogo: await urlDeDescarga(grupo?.logoUrl) };
 });
 
 router.get("/grupos/{idGrupo}/miembros", async ({ parametros, consulta }) => {
@@ -606,15 +637,18 @@ router.get("/estadisticas", async () => reporteria.listarEstadisticas());
 
 router.post("/archivos/subidas", async ({ cuerpo }) => {
   const proceso = textoRequerido(cuerpo["proceso"], "proceso", 30).toUpperCase();
-  if (proceso !== "SOLICITUD_GRUPO" && proceso !== "ACTIVIDAD" && proceso !== "COMPROBANTE") {
-    throw solicitudInvalida("proceso debe ser SOLICITUD_GRUPO, ACTIVIDAD o COMPROBANTE.");
+  if (proceso !== "SOLICITUD_GRUPO" && proceso !== "ACTIVIDAD" && proceso !== "COMPROBANTE" && proceso !== "GRUPO") {
+    throw solicitudInvalida("proceso debe ser SOLICITUD_GRUPO, ACTIVIDAD, COMPROBANTE o GRUPO.");
   }
   const idReferencia = enteroRequerido(cuerpo["idReferencia"], "idReferencia");
   const esActividad = proceso === "ACTIVIDAD" || proceso === "COMPROBANTE";
   const existe = esActividad
     ? await consultas.obtenerActividad(idReferencia)
-    : await consultas.obtenerSolicitudGrupo(idReferencia);
-  if (!existe) throw noEncontrado(`No existe ${esActividad ? "la actividad" : "la solicitud"} ${idReferencia}.`);
+    : proceso === "GRUPO"
+      ? await consultas.existeGrupo(idReferencia)
+      : await consultas.obtenerSolicitudGrupo(idReferencia);
+  const que = esActividad ? "la actividad" : proceso === "GRUPO" ? "el grupo" : "la solicitud";
+  if (!existe) throw noEncontrado(`No existe ${que} ${idReferencia}.`);
 
   return creado(await firmarSubida(
     PREFIJO_ARCHIVOS[proceso](idReferencia),

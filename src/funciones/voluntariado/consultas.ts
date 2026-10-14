@@ -195,7 +195,7 @@ export async function obtenerGrupo(idGrupo: number) {
   // tblGrupos no guarda mision, vision ni resena: viven en la solicitud que
   // le dio origen, enlazada por idGrupoCreado. Un grupo cargado a mano, sin
   // solicitud, simplemente no las tiene.
-  const grupo = await consultarUna(`
+  const grupo = await consultarUna<{ logoUrl: string | null } & Record<string, unknown>>(`
     SELECT g.idGrupo, g.nombreGrupo, g.descripcionGrupo, g.fechaCreacionGrupo, g.logoUrl,
            g.redesSociales, g.estadoGrupo, g.fechaRegistro,
            s.misionGrupo, s.visionGrupo, s.resenaHistorica, s.propositoGrupo,
@@ -232,6 +232,68 @@ export async function obtenerGrupo(idGrupo: number) {
   ]);
 
   return { ...grupo, campus, redesTematicas: redes, juntaDirectiva: junta };
+}
+
+/* Edicion de un grupo ya creado. Solo lo que vive en tblGrupos y sus redes:
+   el nombre no se cambia (es unico a nivel nacional y fue lo que la VOAE
+   aprobo), y mision, vision y resena viven en la solicitud de origen, que es
+   un registro historico y no se reescribe. Cada campo es opcional: lo que no
+   viene no se toca. */
+export interface CambiosGrupo {
+  descripcionGrupo?: string | null;
+  redesSociales?: string | null;
+  logoUrl?: string | null;
+  redesTematicas?: number[];
+}
+
+export async function editarGrupo(idGrupo: number, cambios: CambiosGrupo, usuario: string) {
+  await enTransaccion(async (ejecutar) => {
+    const columnas: string[] = [];
+    const parametros: Record<string, Parametro> = { idGrupo: [sql.Int, idGrupo] };
+    if (cambios.descripcionGrupo !== undefined) {
+      columnas.push("descripcionGrupo = @descripcion");
+      parametros["descripcion"] = [sql.NVarChar(sql.MAX), cambios.descripcionGrupo];
+    }
+    if (cambios.redesSociales !== undefined) {
+      columnas.push("redesSociales = @redesSociales");
+      parametros["redesSociales"] = [sql.NVarChar(300), cambios.redesSociales];
+    }
+    if (cambios.logoUrl !== undefined) {
+      columnas.push("logoUrl = @logo");
+      parametros["logo"] = [sql.NVarChar(300), cambios.logoUrl];
+    }
+    if (columnas.length > 0) {
+      await ejecutar(`UPDATE Voluntariado.tblGrupos SET ${columnas.join(", ")} WHERE idGrupo = @idGrupo`, parametros);
+    }
+
+    if (cambios.redesTematicas !== undefined) {
+      const lista = [...new Set(cambios.redesTematicas)];
+      const ids = lista.map((_, i) => `@red${i}`).join(", ");
+      const paramsRedes: Record<string, Parametro> = { idGrupo: [sql.Int, idGrupo], usuario: [sql.NVarChar(90), usuario] };
+      lista.forEach((id, i) => { paramsRedes[`red${i}`] = [sql.Int, id]; });
+
+      const validas = await ejecutar<{ total: number }>(`
+        SELECT COUNT(*) AS total FROM Voluntariado.tblRedesTematicas r
+         WHERE r.idRedTematica IN (${ids})
+           AND (r.estadoRedTematica = 1
+                OR EXISTS (SELECT 1 FROM Voluntariado.tblGruposRedesTematicas gr
+                            WHERE gr.idGrupo = @idGrupo AND gr.idRedTematica = r.idRedTematica))`, paramsRedes);
+      if ((validas[0]?.total ?? 0) !== lista.length) {
+        throw conflicto("Alguna de las redes tematicas no existe o esta inactiva.");
+      }
+      await ejecutar(`
+        DELETE FROM Voluntariado.tblGruposRedesTematicas
+         WHERE idGrupo = @idGrupo AND idRedTematica NOT IN (${ids})`, paramsRedes);
+      await ejecutar(`
+        INSERT INTO Voluntariado.tblGruposRedesTematicas (idGrupo, idRedTematica, usuarioRegistro)
+        SELECT @idGrupo, r.idRedTematica, @usuario
+          FROM Voluntariado.tblRedesTematicas r
+         WHERE r.idRedTematica IN (${ids})
+           AND NOT EXISTS (SELECT 1 FROM Voluntariado.tblGruposRedesTematicas gr
+                            WHERE gr.idGrupo = @idGrupo AND gr.idRedTematica = r.idRedTematica)`, paramsRedes);
+    }
+  });
+  return obtenerGrupo(idGrupo);
 }
 
 export const listarCampusDeGrupo = (idGrupo: number) =>
