@@ -16,7 +16,7 @@
  */
 import { build } from "esbuild";
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -69,30 +69,42 @@ for (const funcion of funciones) {
     ) + "\n",
   );
 
+  // En Windows npm es npm.cmd, y Node solo lo ejecuta a traves de un shell.
   execFileSync("npm", ["install", "--omit=dev", "--no-audit", "--no-fund", "--silent"], {
     cwd: destino,
     stdio: "inherit",
+    shell: process.platform === "win32",
   });
 
   // package-lock del staging: ruido dentro del zip.
   rmSync(join(destino, "package-lock.json"), { force: true });
 
   // No hay `zip` en la maquina; python3 si, y produce el mismo formato.
+  // Windows no trae python3 pero si el tar de System32 (bsdtar), que con -a
+  // escribe zip. Se llama por ruta: el tar de Git Bash es GNU y no sabe zip.
   const rutaZip = join(raiz, "dist", `voae-${funcion}.zip`);
   rmSync(rutaZip, { force: true });
-  execFileSync(
-    "python3",
-    [
-      "-c",
+  if (process.platform === "win32") {
+    const tarWindows = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe");
+    // Las entradas por nombre y no ".": asi quedan `index.js`, no `./index.js`.
+    execFileSync(tarWindows, ["-a", "-c", "-f", rutaZip, "-C", destino, ...readdirSync(destino)], {
+      stdio: "inherit",
+    });
+  } else {
+    execFileSync(
+      "python3",
       [
-        "import shutil,sys",
-        "shutil.make_archive(sys.argv[1], 'zip', sys.argv[2])",
-      ].join("\n"),
-      rutaZip.replace(/\.zip$/, ""),
-      destino,
-    ],
-    { stdio: "inherit" },
-  );
+        "-c",
+        [
+          "import shutil,sys",
+          "shutil.make_archive(sys.argv[1], 'zip', sys.argv[2])",
+        ].join("\n"),
+        rutaZip.replace(/\.zip$/, ""),
+        destino,
+      ],
+      { stdio: "inherit" },
+    );
+  }
 
   const tamanio = readFileSync(rutaZip).byteLength;
   console.log(`  ${rutaZip}  (${(tamanio / 1024 / 1024).toFixed(1)} MB)`);
