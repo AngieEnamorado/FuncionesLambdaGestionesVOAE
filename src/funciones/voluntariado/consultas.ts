@@ -586,12 +586,25 @@ export async function resolverSolicitudGrupo(
     const cuentasSinPersona: string[] = [];
 
     if (codigoEstado === "APROBADA") {
+      // El logo que se adjunto a la solicitud pasa a ser el del grupo. La
+      // llave sigue colgando de la solicitud; si el grupo cambia de logo al
+      // editarse, la nueva ya cuelga de voluntariado/grupos/{id}/.
       const grupo = await ejecutar<{ idGrupo: number }>(`
         INSERT INTO Voluntariado.tblGrupos
-            (nombreGrupo, descripcionGrupo, fechaCreacionGrupo, usuarioRegistro)
+            (nombreGrupo, descripcionGrupo, fechaCreacionGrupo, logoUrl, usuarioRegistro)
         OUTPUT INSERTED.idGrupo
-        VALUES (@nombre, @descripcion, @fechaCreacion, @usuario)
+        SELECT @nombre, @descripcion, @fechaCreacion,
+               (SELECT TOP 1 a.archivoUrl
+                  FROM Voluntariado.tblAdjuntosSolicitudes a
+                  INNER JOIN Voluntariado.tblRequisitosAdjuntos r
+                          ON r.idRequisitoAdjunto = a.idRequisitoAdjunto
+                 WHERE a.idSolicitudGrupoNuevo = @id
+                   AND r.procesoRequisito = N'SOLICITUD_GRUPO'
+                   AND r.tipoRequisito = N'LOGO'
+                 ORDER BY a.idAdjuntoSolicitud DESC),
+               @usuario
       `, {
+        id: [sql.Int, idSolicitud],
         nombre: [sql.NVarChar(150), solicitud.nombreGrupo],
         descripcion: [sql.NVarChar(sql.MAX), solicitud.propositoGrupo ?? solicitud.resenaHistorica],
         fechaCreacion: [sql.Date, solicitud.fechaCreacionGrupo],
@@ -631,11 +644,30 @@ export async function resolverSolicitudGrupo(
          WHERE j.idSolicitudGrupoNuevo = @id
       `, { id: [sql.Int, idSolicitud] });
 
-      for (const fila of junta) {
+      // Los fundadores que no ocupan cargo en la junta entran como miembros
+      // sin cargo. Van despues de la junta para que quien tiene ambos papeles
+      // conserve su cargo (un grupo no admite dos filas de la misma persona).
+      const fundadores = await ejecutar<{ numeroCuenta: string; idPersona: number | null }>(`
+        SELECT f.numeroCuenta, de.idPersona
+          FROM Voluntariado.tblSolicitudesMiembrosFundadores f
+          LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.numeroCuenta = f.numeroCuenta
+         WHERE f.idSolicitudGrupoNuevo = @id
+      `, { id: [sql.Int, idSolicitud] });
+
+      const yaMiembros = new Set<number>();
+      const miembros = [
+        ...junta,
+        ...fundadores.map((fila) => ({ ...fila, idCargo: CARGO_MIEMBRO })),
+      ];
+
+      for (const fila of miembros) {
         if (fila.idPersona === null) {
-          cuentasSinPersona.push(fila.numeroCuenta);
+          if (!cuentasSinPersona.includes(fila.numeroCuenta)) cuentasSinPersona.push(fila.numeroCuenta);
           continue;
         }
+        if (yaMiembros.has(fila.idPersona)) continue;
+        yaMiembros.add(fila.idPersona);
+
         await ejecutar(`
           INSERT INTO Voluntariado.tblMiembrosGrupos
               (idGrupo, idPersona, idCargo, esFundador, fechaIngreso, usuarioRegistro)
