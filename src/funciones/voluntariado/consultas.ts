@@ -988,6 +988,46 @@ export const agregarFoto = (
     usuario: [sql.NVarChar(90), usuario],
   });
 
+/**
+ * Quita una foto de la evidencia. Solo el registro: el objeto queda en S3
+ * (el rol de las Lambdas no tiene permiso de borrar en el bucket). No se
+ * permite si la actividad esta en un informe trimestral enviado o aceptado:
+ * esa evidencia ya la esta revisando, o la aprobo, la VOAE.
+ */
+export async function quitarFoto(idActividad: number, idFotoActividad: number) {
+  const foto = await consultarUna<{ idFotoActividad: number; informeCerrado: string | null }>(`
+    SELECT f.idFotoActividad,
+           (SELECT TOP 1 e.codigoEstado
+              FROM Voluntariado.tblInformesTrimestralesActividades ia
+              INNER JOIN Voluntariado.tblInformesTrimestrales i ON i.idInformeTrimestral = ia.idInformeTrimestral
+              INNER JOIN Catalogo.tblEstados e ON e.idEstado = i.idEstado
+             WHERE ia.idActividad = f.idActividad
+               AND e.codigoEstado IN (N'ENVIADO', N'ACEPTADO')) AS informeCerrado
+      FROM Voluntariado.tblFotosActividades f
+     WHERE f.idFotoActividad = @idFoto AND f.idActividad = @idActividad
+  `, {
+    idFoto: [sql.Int, idFotoActividad],
+    idActividad: [sql.Int, idActividad],
+  });
+  if (!foto) throw noEncontrado(`La actividad ${idActividad} no tiene la foto ${idFotoActividad}.`);
+  if (foto.informeCerrado) {
+    throw conflicto(
+      foto.informeCerrado === "ACEPTADO"
+        ? "El informe trimestral de esta actividad ya fue aceptado; su evidencia no se puede cambiar."
+        : "El informe trimestral de esta actividad esta en revision de la VOAE; espera su dictamen para cambiar la evidencia.",
+    );
+  }
+
+  await consultar(`
+    DELETE FROM Voluntariado.tblFotosActividades
+     WHERE idFotoActividad = @idFoto AND idActividad = @idActividad
+  `, {
+    idFoto: [sql.Int, idFotoActividad],
+    idActividad: [sql.Int, idActividad],
+  });
+  return { idActividad, idFotoActividad, quitada: true };
+}
+
 /* ----------------------------- Participaciones --------------------------
    De aqui salen las horas confirmadas y el porcentaje que decide la
    elegibilidad a diploma. Un trigger exige que toda participacion marcada

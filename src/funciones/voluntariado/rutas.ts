@@ -369,6 +369,12 @@ router.post("/actividades/{id}/fotos", async ({ parametros, cuerpo, usuarioRegis
   ));
 });
 
+router.delete("/actividades/{id}/fotos/{idFoto}", async ({ parametros }) =>
+  consultas.quitarFoto(
+    enteroRequerido(parametros["id"], "id"),
+    enteroRequerido(parametros["idFoto"], "idFoto"),
+  ));
+
 /* ----------------------------- Participaciones -------------------------- */
 
 router.get("/actividades/{id}/participaciones", async ({ parametros }) => {
