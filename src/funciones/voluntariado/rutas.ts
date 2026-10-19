@@ -117,11 +117,17 @@ router.put("/trimestres/{id}", async ({ parametros, cuerpo }) => {
 
 /* -------------------------------- Grupos -------------------------------- */
 
-router.get("/grupos", async ({ consulta }) =>
-  consultas.listarGrupos(
+router.get("/grupos", async ({ consulta }) => {
+  const grupos = await consultas.listarGrupos(
     enteroOpcional(consulta["campus"], "campus"),
     enteroOpcional(consulta["red"], "red"),
-  ));
+  );
+  // Firmar es un calculo local, sin viaje a S3: alcanza para cada grupo de la lista.
+  return Promise.all(grupos.map(async (g) => ({
+    ...g,
+    urlLogo: await urlDeDescarga((g as { logoUrl?: string | null }).logoUrl),
+  })));
+});
 
 router.get("/grupos/{idGrupo}", async ({ parametros }) => {
   const idGrupo = enteroRequerido(parametros["idGrupo"], "idGrupo");
