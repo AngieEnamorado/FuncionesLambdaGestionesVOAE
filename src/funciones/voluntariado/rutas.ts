@@ -376,6 +376,33 @@ router.get("/actividades/{id}/participaciones", async ({ parametros }) => {
  * Pasar lista. De aqui salen las horas confirmadas de cada estudiante, que
  * son las que despues deciden su diploma.
  */
+/* Tope de horas por participacion. Una actividad es de un solo dia, asi que
+   cubre una jornada completa y frena errores de digitacion (34 por 4). El
+   frontend usa el mismo valor en Pasar lista. */
+const MAXIMO_HORAS_PARTICIPACION = 12;
+
+/**
+ * Horas de una linea de asistencia: vacias se dejan en null (el trigger exige
+ * horas para ASISTIO y su mensaje es el que debe llegar al usuario); si vienen,
+ * tienen que ser un numero entre 0 y el tope, y mayor que 0 si asistio.
+ */
+function horasDeLinea(valor: unknown, codigoEstado: string, campo: string): number | null {
+  if (valor === undefined || valor === null || valor === "") return null;
+  const horas = Number(valor);
+  if (!Number.isFinite(horas) || horas < 0) {
+    throw solicitudInvalida(`${campo} debe ser un numero de horas valido.`);
+  }
+  if (horas > MAXIMO_HORAS_PARTICIPACION) {
+    throw solicitudInvalida(
+      `${campo} no puede pasar de ${MAXIMO_HORAS_PARTICIPACION} horas por actividad (llego ${horas}).`,
+    );
+  }
+  if (codigoEstado === "ASISTIO" && horas === 0) {
+    throw solicitudInvalida(`${campo}: quien asistio debe tener mas de 0 horas.`);
+  }
+  return horas;
+}
+
 router.post("/actividades/{id}/asistencia", async ({ parametros, cuerpo, usuarioRegistro }) => {
   const idActividad = enteroRequerido(parametros["id"], "id");
   const actividad = await consultas.obtenerActividad(idActividad);
@@ -389,7 +416,6 @@ router.post("/actividades/{id}/asistencia", async ({ parametros, cuerpo, usuario
   const lineas = filas.map((fila, indice) => {
     const linea = fila as Record<string, unknown>;
     const codigoEstado = textoRequerido(linea["estado"], `participaciones[${indice}].estado`, 40).toUpperCase();
-    const horas = linea["horas"];
     return {
       idPersona: enteroRequerido(linea["idPersona"], `participaciones[${indice}].idPersona`),
       idGrupo: enteroOpcional(linea["idGrupo"], `participaciones[${indice}].idGrupo`)
@@ -397,9 +423,7 @@ router.post("/actividades/{id}/asistencia", async ({ parametros, cuerpo, usuario
       codigoEstado,
       tipoParticipante: textoOpcional(linea["tipoParticipante"], `participaciones[${indice}].tipoParticipante`, 25)
         ?? "ESTUDIANTE_PARTICIPANTE",
-      // Las horas no se validan aqui: un trigger exige que toda participacion
-      // ASISTIO las traiga, y su mensaje es el que debe llegar al usuario.
-      horasParticipacion: horas === undefined || horas === null || horas === "" ? null : Number(horas),
+      horasParticipacion: horasDeLinea(linea["horas"], codigoEstado, `participaciones[${indice}].horas`),
     };
   });
 
