@@ -20,6 +20,7 @@ import {
   textoRequerido,
 } from "../../compartido/validacion";
 import * as consultas from "./consultas";
+import * as avisos from "./notificaciones";
 import * as reporteria from "../reporteria/voluntariado";
 
 export const router = crearRouter("/v1/voluntariado");
@@ -253,7 +254,9 @@ router.post("/solicitudes-grupos/{id}/resolucion", async ({ parametros, cuerpo, 
   }
   const redes = lista(cuerpo["redesTematicas"], "redesTematicas").map((idRed, indice) =>
     enteroRequerido(idRed, `redesTematicas[${indice}]`));
-  return consultas.resolverSolicitudGrupo(id, estado, motivo, redes, usuarioRegistro);
+  const resultado = await consultas.resolverSolicitudGrupo(id, estado, motivo, redes, usuarioRegistro);
+  await avisos.avisar("solicitudGrupo", () => avisos.solicitudGrupoResuelta(id, estado, motivo, usuarioRegistro));
+  return resultado;
 });
 
 router.post("/solicitudes-grupos/{id}/adjuntos", async ({ parametros, cuerpo, usuarioRegistro }) => {
@@ -284,24 +287,30 @@ router.get("/grupos/{idGrupo}/solicitudes-union", async (peticion) => {
 router.post("/grupos/{idGrupo}/solicitudes-union", async ({ parametros, cuerpo, usuarioRegistro }) => {
   const idGrupo = enteroRequerido(parametros["idGrupo"], "idGrupo");
   await exigirGrupo(idGrupo);
-  return creado(await consultas.crearSolicitudUnion(
+  const idPersona = enteroRequerido(cuerpo["idPersona"], "idPersona");
+  const solicitud = await consultas.crearSolicitudUnion(
     idGrupo,
-    enteroRequerido(cuerpo["idPersona"], "idPersona"),
+    idPersona,
     textoOpcional(cuerpo["mensaje"], "mensaje", 500),
     usuarioRegistro,
-  ));
+  );
+  await avisos.avisar("unionCreada", () => avisos.solicitudUnionCreada(idGrupo, idPersona, usuarioRegistro));
+  return creado(solicitud);
 });
 
 router.post("/solicitudes-union/{id}/resolucion", async ({ parametros, cuerpo, usuarioRegistro }) => {
   const id = enteroRequerido(parametros["id"], "id");
   const estado = codigoRequerido({ cuerpo } as Peticion, ["APROBADA", "RECHAZADA"]);
-  return consultas.resolverSolicitudUnion(
+  const motivo = textoOpcional(cuerpo["motivo"], "motivo", 4000);
+  const resultado = await consultas.resolverSolicitudUnion(
     id,
     estado,
     enteroOpcional(cuerpo["idPersonaResuelve"], "idPersonaResuelve"),
-    textoOpcional(cuerpo["motivo"], "motivo", 4000),
+    motivo,
     usuarioRegistro,
   );
+  await avisos.avisar("unionResuelta", () => avisos.solicitudUnionResuelta(id, estado, motivo, usuarioRegistro));
+  return resultado;
 });
 
 /* ------------------------------ Actividades ----------------------------- */
@@ -337,12 +346,13 @@ router.post("/actividades", async ({ cuerpo, usuarioRegistro }) => {
   return creado(await consultas.obtenerActividad(idActividad));
 });
 
-router.post("/actividades/{id}/aprobacion", async ({ parametros, cuerpo }) => {
+router.post("/actividades/{id}/aprobacion", async ({ parametros, cuerpo, usuarioRegistro }) => {
   const id = enteroRequerido(parametros["id"], "id");
   const estado = codigoRequerido({ cuerpo } as Peticion,
     ["APROBADA", "RECHAZADA", "EJECUTADA", "CANCELADA"]);
   const actividad = await consultas.resolverActividad(id, estado);
   if (!actividad) throw noEncontrado(`No existe la actividad ${id}.`);
+  await avisos.avisar("actividad", () => avisos.actividadResuelta(id, estado, usuarioRegistro));
   return actividad;
 });
 
@@ -505,7 +515,7 @@ router.post("/informes/{id}/envio", async ({ parametros }) =>
     true,
   ));
 
-router.post("/informes/{id}/dictamen", async ({ parametros, cuerpo }) => {
+router.post("/informes/{id}/dictamen", async ({ parametros, cuerpo, usuarioRegistro }) => {
   const id = enteroRequerido(parametros["id"], "id");
   const estado = codigoRequerido({ cuerpo } as Peticion, ["ACEPTADO", "OBSERVADO"]);
   const observaciones = textoOpcional(cuerpo["observaciones"], "observaciones", 4000);
@@ -513,7 +523,9 @@ router.post("/informes/{id}/dictamen", async ({ parametros, cuerpo }) => {
   if (estado === "OBSERVADO" && observaciones === null) {
     throw solicitudInvalida("Observar un informe exige decir que se observa.");
   }
-  return consultas.cambiarEstadoInforme(id, estado, ["ENVIADO"], observaciones, false);
+  const informe = await consultas.cambiarEstadoInforme(id, estado, ["ENVIADO"], observaciones, false);
+  await avisos.avisar("informe", () => avisos.informeDictaminado(id, estado, observaciones, usuarioRegistro));
+  return informe;
 });
 
 /* ---------------------------- Informe economico ------------------------- */
@@ -618,15 +630,19 @@ router.post("/diplomas", async ({ cuerpo, usuarioRegistro }) => {
     throw solicitudInvalida("porcentajeParticipacion debe estar entre 0 y 100.");
   }
 
-  return creado(await consultas.emitirDiploma({
-    idGrupo: enteroRequerido(cuerpo["idGrupo"], "idGrupo"),
-    idPersona: enteroRequerido(cuerpo["idPersona"], "idPersona"),
+  const idGrupo = enteroRequerido(cuerpo["idGrupo"], "idGrupo");
+  const idPersona = enteroRequerido(cuerpo["idPersona"], "idPersona");
+  const diploma = await consultas.emitirDiploma({
+    idGrupo,
+    idPersona,
     ventanaDiploma: textoRequerido(cuerpo["ventanaDiploma"], "ventanaDiploma", 20),
     actividadesGrupo: enteroRequerido(cuerpo["actividadesGrupo"], "actividadesGrupo"),
     actividadesAsistidas: enteroRequerido(cuerpo["actividadesAsistidas"], "actividadesAsistidas"),
     porcentajeParticipacion: porcentaje,
     archivoUrl: textoOpcional(cuerpo["archivoUrl"], "archivoUrl", 300),
-  }, usuarioRegistro));
+  }, usuarioRegistro);
+  await avisos.avisar("diploma", () => avisos.diplomaEmitido(idGrupo, idPersona, usuarioRegistro));
+  return creado(diploma);
 });
 
 router.get("/diplomas/participacion", async ({ consulta }) => {
