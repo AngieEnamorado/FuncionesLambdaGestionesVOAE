@@ -968,14 +968,38 @@ export const guardarResultados = (idActividad: number, resultados: string) =>
     id: [sql.Int, idActividad],
   });
 
-export const agregarFoto = (
+/**
+ * La evidencia (fotos) de una actividad no cambia mientras su informe
+ * trimestral este enviado (la VOAE lo esta revisando) o aceptado (ya lo
+ * aprobo). Una actividad conjunta puede estar en varios informes: basta uno.
+ */
+async function exigirEvidenciaEditable(idActividad: number): Promise<void> {
+  const fila = await consultarUna<{ codigoEstado: string }>(`
+    SELECT TOP 1 e.codigoEstado
+      FROM Voluntariado.tblInformesTrimestralesActividades ia
+      INNER JOIN Voluntariado.tblInformesTrimestrales i ON i.idInformeTrimestral = ia.idInformeTrimestral
+      INNER JOIN Catalogo.tblEstados e ON e.idEstado = i.idEstado
+     WHERE ia.idActividad = @idActividad
+       AND e.codigoEstado IN (N'ENVIADO', N'ACEPTADO')
+     ORDER BY CASE e.codigoEstado WHEN N'ACEPTADO' THEN 0 ELSE 1 END
+  `, { idActividad: [sql.Int, idActividad] });
+  if (!fila) return;
+  throw conflicto(
+    fila.codigoEstado === "ACEPTADO"
+      ? "El informe trimestral de esta actividad ya fue aceptado; su evidencia no se puede cambiar."
+      : "El informe trimestral de esta actividad esta en revision de la VOAE; espera su dictamen para cambiar la evidencia.",
+  );
+}
+
+export async function agregarFoto(
   idActividad: number,
   archivoUrl: string,
   descripcion: string | null,
   idRequisitoAdjunto: number | null,
   usuario: string,
-) =>
-  consultarUna(`
+) {
+  await exigirEvidenciaEditable(idActividad);
+  return consultarUna(`
     INSERT INTO Voluntariado.tblFotosActividades
         (idActividad, idRequisitoAdjunto, archivoUrl, descripcionFoto, usuarioRegistro)
     OUTPUT INSERTED.idFotoActividad, INSERTED.archivoUrl
@@ -987,44 +1011,25 @@ export const agregarFoto = (
     descripcion: [sql.NVarChar(200), descripcion],
     usuario: [sql.NVarChar(90), usuario],
   });
+}
 
 /**
  * Quita una foto de la evidencia. Solo el registro: el objeto queda en S3
- * (el rol de las Lambdas no tiene permiso de borrar en el bucket). No se
- * permite si la actividad esta en un informe trimestral enviado o aceptado:
- * esa evidencia ya la esta revisando, o la aprobo, la VOAE.
+ * (el rol de las Lambdas no tiene permiso de borrar en el bucket).
  */
 export async function quitarFoto(idActividad: number, idFotoActividad: number) {
-  const foto = await consultarUna<{ idFotoActividad: number; informeCerrado: string | null }>(`
-    SELECT f.idFotoActividad,
-           (SELECT TOP 1 e.codigoEstado
-              FROM Voluntariado.tblInformesTrimestralesActividades ia
-              INNER JOIN Voluntariado.tblInformesTrimestrales i ON i.idInformeTrimestral = ia.idInformeTrimestral
-              INNER JOIN Catalogo.tblEstados e ON e.idEstado = i.idEstado
-             WHERE ia.idActividad = f.idActividad
-               AND e.codigoEstado IN (N'ENVIADO', N'ACEPTADO')) AS informeCerrado
-      FROM Voluntariado.tblFotosActividades f
-     WHERE f.idFotoActividad = @idFoto AND f.idActividad = @idActividad
-  `, {
-    idFoto: [sql.Int, idFotoActividad],
-    idActividad: [sql.Int, idActividad],
-  });
+  const parametros = { idFoto: [sql.Int, idFotoActividad], idActividad: [sql.Int, idActividad] } satisfies Record<string, Parametro>;
+  const foto = await consultarUna(`
+    SELECT idFotoActividad FROM Voluntariado.tblFotosActividades
+     WHERE idFotoActividad = @idFoto AND idActividad = @idActividad
+  `, parametros);
   if (!foto) throw noEncontrado(`La actividad ${idActividad} no tiene la foto ${idFotoActividad}.`);
-  if (foto.informeCerrado) {
-    throw conflicto(
-      foto.informeCerrado === "ACEPTADO"
-        ? "El informe trimestral de esta actividad ya fue aceptado; su evidencia no se puede cambiar."
-        : "El informe trimestral de esta actividad esta en revision de la VOAE; espera su dictamen para cambiar la evidencia.",
-    );
-  }
+  await exigirEvidenciaEditable(idActividad);
 
   await consultar(`
     DELETE FROM Voluntariado.tblFotosActividades
      WHERE idFotoActividad = @idFoto AND idActividad = @idActividad
-  `, {
-    idFoto: [sql.Int, idFotoActividad],
-    idActividad: [sql.Int, idActividad],
-  });
+  `, parametros);
   return { idActividad, idFotoActividad, quitada: true };
 }
 
