@@ -282,17 +282,14 @@ que lee de varios esquemas, y lo hace **solo en modo lectura**.
 
 **Esquemas:** `Giras`, `Procad`, `Voluntariado`, `Catalogo` (lectura)
 
-**Estado (2026-10-12):** primera versión construida en `src/funciones/reporteria/`, con Voluntariado
-y Giras. PROCAD queda fuera hasta acordar con quien lleva ese módulo qué unidad devuelve la API (su
-panel sigue sobre datos de prueba). Giras devuelve **registros** (una fila por solicitud no
-borrador) en lugar de estadísticas precocinadas, por la misma razón que se da abajo para PROCAD: el
-panel filtra y suma en el cliente. Las rutas provisionales `/tablero` y `/estadisticas` de
-`voae-voluntariado` importan el SQL de reportería, así que no hay dos copias; se borran cuando
-ningún frontend desplegado las llame.
+**Estado (2026-10-12):** primera versión construida en `src/funciones/reporteria/`, solo con
+Voluntariado. Giras y PROCAD quedan fuera hasta acordarlo con quienes llevan esos módulos. Las rutas
+provisionales `/tablero` y `/estadisticas` de `voae-voluntariado` importan el SQL de reportería, así que no
+hay dos copias; se borran cuando ningún frontend desplegado las llame.
 
 | Endpoint | Qué hace |
 |---|---|
-| `GET /v1/reporteria/giras/registros` | **Construido.** Una fila por solicitud enviada con período, campus, facultad, finalidad, alcance, estado, destino, estudiantes y costo. El dashboard de Giras (`giras/Estadisticas.tsx`) agrega en el cliente. Reemplaza al plan original de `/giras/estadisticas`. |
+| `GET /v1/reporteria/giras/estadisticas` | KPIs y series del dashboard de Giras: giras por período, campus, facultad, finalidad, alcance, costo, estudiantes movilizados. Pantalla `giras/Estadisticas.tsx`. |
 | `GET /v1/reporteria/procad/estadisticas` | Cifras por agrupación y los rollups por centro regional. Pantalla `procad/Estadisticas.tsx`. Ojo: el frontend nunca consulta una métrica ya agregada — filtra, suma y escala desde la unidad por agrupación. Conviene que la API devuelva esa misma unidad y no totales pre-cocinados, para que el panel no pueda contradecirse. |
 | `GET /v1/reporteria/procad/reporte-personalizado` | Reporte armado según la selección que el panel lleva en la URL (`ReportePersonalizado.tsx`). |
 | `GET /v1/reporteria/voluntariado/tablero` | **Construido.** Tablero nacional (`TableroNacional.tsx`). |
