@@ -31,7 +31,20 @@ async function conectar(): Promise<sql.ConnectionPool> {
     port: secreto.DB_PORT ? Number(secreto.DB_PORT) : 1433,
     options: {
       encrypt: true, // obligatorio en Azure SQL
-      trustServerCertificate: false,
+      // Aceptar el certificado sin validarlo solo se permite en pruebas locales
+      // (infra/servidor-local.mjs pone VOAE_ENTORNO=local); en Lambda, aunque
+      // el secreto lo pida, se valida siempre.
+      trustServerCertificate:
+        process.env.VOAE_ENTORNO === "local" && secreto.DB_CONFIAR_CERTIFICADO === "true",
+      // Un SQL Server propio no tiene certificado de una CA publica: el secreto
+      // trae el suyo y solo ese se acepta (certificado fijado). Sin la clave,
+      // como en Azure, se valida contra las CA de siempre.
+      ...(secreto.DB_CERTIFICADO
+        ? {
+            cryptoCredentialsDetails: { ca: secreto.DB_CERTIFICADO },
+            ...(secreto.DB_NOMBRE_CERTIFICADO ? { serverName: secreto.DB_NOMBRE_CERTIFICADO } : {}),
+          }
+        : {}),
       // Las fechas viajan como texto ISO en JSON; leerlas en UTC evita que el
       // huso de la Lambda (UTC) y el de Honduras (UTC-6) se contradigan.
       useUTC: true,

@@ -6,29 +6,69 @@
  * como notificacion; si mas adelante se conecta un envio, saldran solos. La
  * lectura y el "marcar leida" los sirve voae-catalogo (/notificaciones).
  *
- * Cada aviso es un INSERT ... SELECT: destinatario, correo y nombres salen de
- * la base, y si la persona o el grupo no existen no se inserta nada. Las
- * columnas de PROCAD y Giras quedan en NULL.
+ * Cada aviso se arma en dos pasos: primero se leen los destinatarios (y lo que
+ * el texto necesita), luego se insertan. Desde la v2 el correo y el nombre de
+ * un estudiante viven en Registro, no en tblPersonas: se completan entre los
+ * dos pasos con una sola consulta (compartido/registro.ts), fuera de cualquier
+ * transaccion. correoDestino queda como registro del envio (asi lo decidio el
+ * equipo); si Registro no da correo se guarda vacio. Si la persona o el grupo
+ * no existen no se inserta nada. Las columnas de PROCAD y Giras quedan en NULL.
  */
 import { consultar, sql, type Parametro } from "../../compartido/db";
+import { completarConRegistro, completarUnaConRegistro } from "../../compartido/registro";
 import { CARGO_COORDINADOR } from "./consultas";
 
-const INSERTAR = `
-  INSERT INTO Catalogo.tblNotificaciones
-      (sistemaOrigen, tipoNotificacion, idPersonaDestino, correoDestino,
-       asuntoCorreo, cuerpoCorreo, idSolicitudVoluntariado, usuarioRegistro)`;
+/** Destinatario de un aviso, mas las columnas de contexto que traiga su consulta. */
+type Destino = Record<string, unknown> & {
+  idPersona: number;
+  correoPersona: string | null;
+  numeroCuenta: string | null;
+};
 
-/** Los coordinadores activos de un grupo, con su correo. */
+interface Aviso {
+  tipo: string;
+  asunto: string;
+  cuerpo: string;
+  idSolicitudVoluntariado?: number | null;
+}
+
+/** Columnas de destinatario para un alias de tblPersonas (p) y de tblDetallesEstudiantes (de). */
+const DESTINO = (p: string, de: string) => `${p}.idPersona, ${p}.correoPersona, ${de}.numeroCuenta`;
+
+/** Los coordinadores activos de un grupo (alias c), con su cuenta (alias dc). */
 const COORDINADORES = `
   FROM Voluntariado.tblMiembrosGrupos m
   INNER JOIN Catalogo.tblPersonas c ON c.idPersona = m.idPersona
- WHERE m.idCargo = ${CARGO_COORDINADOR} AND m.estadoMiembroGrupo = 1`;
+  LEFT JOIN Catalogo.tblDetallesEstudiantes dc ON dc.idPersona = m.idPersona`;
+const SOLO_COORDINADORES = `m.idCargo = ${CARGO_COORDINADOR} AND m.estadoMiembroGrupo = 1`;
 
-/** "IV Trimestre 2026" a partir de una fila t de tblTrimestres. */
-const NOMBRE_TRIMESTRE = `CONCAT(CASE t.numeroTrimestre WHEN 1 THEN N'I' WHEN 2 THEN N'II' WHEN 3 THEN N'III' ELSE N'IV' END,
-                                 N' Trimestre ', t.anioTrimestre)`;
+const ROMANOS = ["I", "II", "III", "IV"];
+const conMotivo = (cuerpo: string, etiqueta: string, detalle: string | null) =>
+  detalle ? `${cuerpo} ${etiqueta}: ${detalle}` : cuerpo;
 
-const texto = (valor: string | null, largo = 4000): Parametro => [sql.NVarChar(largo), valor];
+async function enviar(destinos: Destino[], armar: (destino: Destino) => Aviso, usuario: string) {
+  if (destinos.length === 0) return;
+  await completarConRegistro(destinos, { correoPersona: "correo" });
+  for (const destino of destinos) {
+    const aviso = armar(destino);
+    await consultar(`
+      INSERT INTO Catalogo.tblNotificaciones
+          (sistemaOrigen, tipoNotificacion, idPersonaDestino, correoDestino,
+           asuntoCorreo, cuerpoCorreo, idSolicitudVoluntariado, usuarioRegistro)
+      VALUES (N'VOLUNTARIADO', @tipo, @idPersona, @correo, @asunto, @cuerpo, @idSolicitud, @usuario)
+    `, {
+      tipo: [sql.NVarChar(50), aviso.tipo],
+      idPersona: [sql.Int, destino.idPersona],
+      correo: [sql.NVarChar(120), (destino.correoPersona ?? "").slice(0, 120)],
+      asunto: [sql.NVarChar(200), aviso.asunto.slice(0, 200)],
+      cuerpo: [sql.NVarChar(sql.MAX), aviso.cuerpo],
+      idSolicitud: [sql.Int, aviso.idSolicitudVoluntariado ?? null],
+      usuario: [sql.NVarChar(90), usuario],
+    });
+  }
+}
+
+const id = (valor: number): Parametro => [sql.Int, valor];
 
 const SOLICITUD_GRUPO: Record<string, { verbo: string; cuerpo: string }> = {
   APROBADA: { verbo: "fue aprobada", cuerpo: "La VOAE aprobó tu grupo: ya aparece en el portal y puedes administrarlo." },
@@ -36,124 +76,117 @@ const SOLICITUD_GRUPO: Record<string, { verbo: string; cuerpo: string }> = {
   DEVUELTA: { verbo: "fue devuelta para corrección", cuerpo: "La VOAE la devolvió para que la corrijas." },
 };
 
-export function solicitudGrupoResuelta(idSolicitud: number, estado: string, motivo: string | null, usuario: string) {
+export async function solicitudGrupoResuelta(idSolicitud: number, estado: string, motivo: string | null, usuario: string) {
   const aviso = SOLICITUD_GRUPO[estado];
-  if (!aviso) return Promise.resolve();
-  return consultar(`${INSERTAR}
-    SELECT N'VOLUNTARIADO', @tipo, p.idPersona, COALESCE(p.correoPersona, N''),
-           LEFT(CONCAT(N'Tu solicitud del grupo «', s.nombreGrupo, N'» ', @verbo), 200),
-           CONCAT(@cuerpo, CASE WHEN @motivo IS NULL THEN N'' ELSE CONCAT(N' Motivo: ', @motivo) END),
-           s.idSolicitudGrupoNuevo, @usuario
+  if (!aviso) return;
+  const destinos = await consultar<Destino>(`
+    SELECT ${DESTINO("p", "de")}, s.nombreGrupo, s.idSolicitudGrupoNuevo
       FROM Voluntariado.tblSolicitudesGruposNuevos s
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = s.idPersonaSolicitante
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = p.idPersona
      WHERE s.idSolicitudGrupoNuevo = @id
-  `, {
-    id: [sql.Int, idSolicitud],
-    tipo: texto(`GRUPO_${estado}`, 50),
-    verbo: texto(aviso.verbo, 100),
-    cuerpo: texto(aviso.cuerpo),
-    motivo: texto(motivo),
-    usuario: texto(usuario, 90),
-  });
+  `, { id: id(idSolicitud) });
+  await enviar(destinos, (d) => ({
+    tipo: `GRUPO_${estado}`,
+    asunto: `Tu solicitud del grupo «${d["nombreGrupo"]}» ${aviso.verbo}`,
+    cuerpo: conMotivo(aviso.cuerpo, "Motivo", motivo),
+    idSolicitudVoluntariado: d["idSolicitudGrupoNuevo"] as number,
+  }), usuario);
 }
 
 /** Alguien pidio unirse: se avisa a los coordinadores del grupo. */
-export function solicitudUnionCreada(idGrupo: number, idPersona: number, usuario: string) {
-  return consultar(`${INSERTAR}
-    SELECT N'VOLUNTARIADO', N'UNION_SOLICITADA', c.idPersona, COALESCE(c.correoPersona, N''),
-           LEFT(CONCAT(N'Nueva solicitud para unirse a «', g.nombreGrupo, N'»'), 200),
-           CONCAT(sol.nombrePersona, N' ', sol.apellidosPersona,
-                  N' pidió unirse al grupo. Revísala en el panel de coordinador, en Solicitudes.'),
-           NULL, @usuario
-      ${COORDINADORES.replace("WHERE", `INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = m.idGrupo
-      INNER JOIN Catalogo.tblPersonas sol ON sol.idPersona = @idPersona
-     WHERE m.idGrupo = @idGrupo AND`)}
-  `, {
-    idGrupo: [sql.Int, idGrupo],
-    idPersona: [sql.Int, idPersona],
-    usuario: texto(usuario, 90),
-  });
+export async function solicitudUnionCreada(idGrupo: number, idPersona: number, usuario: string) {
+  const [destinos, solicitante] = await Promise.all([
+    consultar<Destino>(`
+      SELECT ${DESTINO("c", "dc")}, g.nombreGrupo
+      ${COORDINADORES}
+      INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = m.idGrupo
+     WHERE m.idGrupo = @idGrupo AND ${SOLO_COORDINADORES}
+    `, { idGrupo: id(idGrupo) }),
+    consultar<Record<string, unknown>>(`
+      SELECT NULLIF(LTRIM(RTRIM(CONCAT(p.nombrePersona, N' ', p.apellidosPersona))), N'') AS nombre, de.numeroCuenta
+        FROM Catalogo.tblPersonas p
+        LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = p.idPersona
+       WHERE p.idPersona = @idPersona
+    `, { idPersona: id(idPersona) }).then((filas) => completarUnaConRegistro(filas[0] ?? null, { nombre: "completo" })),
+  ]);
+  const nombre = (solicitante?.["nombre"] as string | null) ?? "Un estudiante";
+  await enviar(destinos, (d) => ({
+    tipo: "UNION_SOLICITADA",
+    asunto: `Nueva solicitud para unirse a «${d["nombreGrupo"]}»`,
+    cuerpo: `${nombre} pidió unirse al grupo. Revísala en el panel de coordinador, en Solicitudes.`,
+  }), usuario);
 }
 
-export function solicitudUnionResuelta(idSolicitudUnion: number, estado: string, motivo: string | null, usuario: string) {
+export async function solicitudUnionResuelta(idSolicitudUnion: number, estado: string, motivo: string | null, usuario: string) {
   const aprobada = estado === "APROBADA";
-  return consultar(`${INSERTAR}
-    SELECT N'VOLUNTARIADO', @tipo, p.idPersona, COALESCE(p.correoPersona, N''),
-           LEFT(CONCAT(N'Tu solicitud para unirte a «', g.nombreGrupo, N'» ', @verbo), 200),
-           CONCAT(@cuerpo, CASE WHEN @motivo IS NULL THEN N'' ELSE CONCAT(N' Motivo: ', @motivo) END),
-           NULL, @usuario
+  const destinos = await consultar<Destino>(`
+    SELECT ${DESTINO("p", "de")}, g.nombreGrupo
       FROM Voluntariado.tblSolicitudesUniones su
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = su.idPersona
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = p.idPersona
       INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = su.idGrupo
      WHERE su.idSolicitudUnion = @id
-  `, {
-    id: [sql.Int, idSolicitudUnion],
-    tipo: texto(`UNION_${estado}`, 50),
-    verbo: texto(aprobada ? "fue aprobada" : "fue rechazada", 100),
-    cuerpo: texto(aprobada ? "Ya eres miembro del grupo." : "El coordinador del grupo no la aceptó."),
-    motivo: texto(motivo),
-    usuario: texto(usuario, 90),
-  });
+  `, { id: id(idSolicitudUnion) });
+  await enviar(destinos, (d) => ({
+    tipo: `UNION_${estado}`,
+    asunto: `Tu solicitud para unirte a «${d["nombreGrupo"]}» ${aprobada ? "fue aprobada" : "fue rechazada"}`,
+    cuerpo: conMotivo(aprobada ? "Ya eres miembro del grupo." : "El coordinador del grupo no la aceptó.", "Motivo", motivo),
+  }), usuario);
 }
 
 /** La VOAE aprobo o rechazo una actividad: se avisa a los coordinadores del grupo organizador. */
-export function actividadResuelta(idActividad: number, estado: string, usuario: string) {
-  if (estado !== "APROBADA" && estado !== "RECHAZADA") return Promise.resolve();
+export async function actividadResuelta(idActividad: number, estado: string, usuario: string) {
+  if (estado !== "APROBADA" && estado !== "RECHAZADA") return;
   const aprobada = estado === "APROBADA";
-  return consultar(`${INSERTAR}
-    SELECT N'VOLUNTARIADO', @tipo, c.idPersona, COALESCE(c.correoPersona, N''),
-           LEFT(CONCAT(N'La actividad «', a.nombreActividad, N'» ', @verbo), 200),
-           @cuerpo, NULL, @usuario
-      ${COORDINADORES.replace("WHERE", `INNER JOIN Voluntariado.tblActividades a ON a.idGrupoOrganizador = m.idGrupo
-     WHERE a.idActividad = @id AND`)}
-  `, {
-    id: [sql.Int, idActividad],
-    tipo: texto(`ACTIVIDAD_${estado}`, 50),
-    verbo: texto(aprobada ? "fue aprobada" : "fue rechazada", 100),
-    cuerpo: texto(aprobada
+  const destinos = await consultar<Destino>(`
+    SELECT ${DESTINO("c", "dc")}, a.nombreActividad
+    ${COORDINADORES}
+    INNER JOIN Voluntariado.tblActividades a ON a.idGrupoOrganizador = m.idGrupo
+     WHERE a.idActividad = @id AND ${SOLO_COORDINADORES}
+  `, { id: id(idActividad) });
+  await enviar(destinos, (d) => ({
+    tipo: `ACTIVIDAD_${estado}`,
+    asunto: `La actividad «${d["nombreActividad"]}» ${aprobada ? "fue aprobada" : "fue rechazada"}`,
+    cuerpo: aprobada
       ? "La VOAE la aprobó: ya pueden inscribirse los estudiantes y, cuando ocurra, pasar lista."
-      : "La VOAE la rechazó."),
-    usuario: texto(usuario, 90),
-  });
+      : "La VOAE la rechazó.",
+  }), usuario);
 }
 
 /** La VOAE acepto u observo un informe trimestral: se avisa a los coordinadores del grupo. */
-export function informeDictaminado(idInforme: number, estado: string, observaciones: string | null, usuario: string) {
+export async function informeDictaminado(idInforme: number, estado: string, observaciones: string | null, usuario: string) {
   const aceptado = estado === "ACEPTADO";
-  return consultar(`${INSERTAR}
-    SELECT N'VOLUNTARIADO', @tipo, c.idPersona, COALESCE(c.correoPersona, N''),
-           LEFT(CONCAT(N'Tu informe del ', ${NOMBRE_TRIMESTRE}, N' ', @verbo), 200),
-           CONCAT(@cuerpo, CASE WHEN @observaciones IS NULL THEN N'' ELSE CONCAT(N' Observaciones: ', @observaciones) END),
-           NULL, @usuario
-      ${COORDINADORES.replace("WHERE", `INNER JOIN Voluntariado.tblInformesTrimestrales i ON i.idGrupo = m.idGrupo
-      INNER JOIN Voluntariado.tblTrimestres t ON t.idTrimestre = i.idTrimestre
-     WHERE i.idInformeTrimestral = @id AND`)}
-  `, {
-    id: [sql.Int, idInforme],
-    tipo: texto(`INFORME_${estado}`, 50),
-    verbo: texto(aceptado ? "fue aceptado" : "fue observado", 100),
-    cuerpo: texto(aceptado
+  const destinos = await consultar<Destino>(`
+    SELECT ${DESTINO("c", "dc")}, t.numeroTrimestre, t.anioTrimestre
+    ${COORDINADORES}
+    INNER JOIN Voluntariado.tblInformesTrimestrales i ON i.idGrupo = m.idGrupo
+    INNER JOIN Voluntariado.tblTrimestres t ON t.idTrimestre = i.idTrimestre
+     WHERE i.idInformeTrimestral = @id AND ${SOLO_COORDINADORES}
+  `, { id: id(idInforme) });
+  await enviar(destinos, (d) => ({
+    tipo: `INFORME_${estado}`,
+    asunto: `Tu informe del ${ROMANOS[Number(d["numeroTrimestre"]) - 1] ?? d["numeroTrimestre"]} Trimestre ${d["anioTrimestre"]} ${aceptado ? "fue aceptado" : "fue observado"}`,
+    cuerpo: conMotivo(aceptado
       ? "La VOAE aceptó el informe."
-      : "La VOAE lo observó: corrige las actividades indicadas y reenvíalo desde el panel de coordinador."),
-    observaciones: texto(observaciones),
-    usuario: texto(usuario, 90),
-  });
+      : "La VOAE lo observó: corrige las actividades indicadas y reenvíalo desde el panel de coordinador.",
+      "Observaciones", observaciones),
+  }), usuario);
 }
 
-export function diplomaEmitido(idGrupo: number, idPersona: number, usuario: string) {
-  return consultar(`${INSERTAR}
-    SELECT N'VOLUNTARIADO', N'DIPLOMA_EMITIDO', p.idPersona, COALESCE(p.correoPersona, N''),
-           LEFT(CONCAT(N'Recibiste el diploma de «', g.nombreGrupo, N'»'), 200),
-           N'La VOAE emitió tu diploma de reconocimiento. Descárgalo en el portal, en Mi historial.',
-           NULL, @usuario
+export async function diplomaEmitido(idGrupo: number, idPersona: number, usuario: string) {
+  const destinos = await consultar<Destino>(`
+    SELECT ${DESTINO("p", "de")}, g.nombreGrupo
       FROM Catalogo.tblPersonas p
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = p.idPersona
       INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = @idGrupo
      WHERE p.idPersona = @idPersona
-  `, {
-    idGrupo: [sql.Int, idGrupo],
-    idPersona: [sql.Int, idPersona],
-    usuario: texto(usuario, 90),
-  });
+  `, { idGrupo: id(idGrupo), idPersona: id(idPersona) });
+  await enviar(destinos, (d) => ({
+    tipo: "DIPLOMA_EMITIDO",
+    asunto: `Recibiste el diploma de «${d["nombreGrupo"]}»`,
+    cuerpo: "La VOAE emitió tu diploma de reconocimiento. Descárgalo en el portal, en Mi historial.",
+  }), usuario);
 }
 
 /**

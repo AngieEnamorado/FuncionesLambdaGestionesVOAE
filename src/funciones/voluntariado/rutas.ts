@@ -10,7 +10,7 @@
  * union a su grupo.
  */
 import { crearRouter, creado, type Peticion } from "../../compartido/router";
-import { noEncontrado, solicitudInvalida } from "../../compartido/errores";
+import { conflicto, noEncontrado, solicitudInvalida } from "../../compartido/errores";
 import { exigirBucket, exigirLlaveDe, firmarSubida, urlDeDescarga } from "../../compartido/archivos";
 import {
   booleanoOpcional,
@@ -232,8 +232,6 @@ router.post("/solicitudes-grupos", async ({ cuerpo, usuarioRegistro }) => {
     misionGrupo: textoOpcional(cuerpo["misionGrupo"], "misionGrupo", 4000),
     visionGrupo: textoOpcional(cuerpo["visionGrupo"], "visionGrupo", 4000),
     edadSolicitante: enteroOpcional(cuerpo["edadSolicitante"], "edadSolicitante"),
-    dniSolicitante: textoOpcional(cuerpo["dniSolicitante"], "dniSolicitante", 20),
-    celularSolicitante: textoOpcional(cuerpo["celularSolicitante"], "celularSolicitante", 30),
     direccionSolicitante: textoOpcional(cuerpo["direccionSolicitante"], "direccionSolicitante", 300),
     fundadores: lista(cuerpo["fundadores"], "fundadores").map((cuenta, indice) =>
       textoRequerido(cuenta, `fundadores[${indice}]`, 15)),
@@ -496,7 +494,14 @@ router.post("/informes", async ({ cuerpo, usuarioRegistro }) =>
 
 router.put("/informes/{id}", async ({ parametros, cuerpo, usuarioRegistro }) => {
   const id = enteroRequerido(parametros["id"], "id");
-  if (!(await consultas.obtenerInforme(id))) throw noEncontrado(`No existe el informe ${id}.`);
+  const informe = await consultas.obtenerInforme(id);
+  if (!informe) throw noEncontrado(`No existe el informe ${id}.`);
+  // tblInformesTrimestralesActividades existe para que un informe enviado no
+  // cambie: su contenido solo se fija mientras el coordinador lo edita.
+  const estado = (informe as { codigoEstado?: string }).codigoEstado;
+  if (estado !== "EN_CAPTURA" && estado !== "OBSERVADO") {
+    throw conflicto(`Un informe ${estado?.toLowerCase() ?? "cerrado"} ya no cambia sus actividades.`);
+  }
 
   return consultas.fijarActividadesDeInforme(
     id,

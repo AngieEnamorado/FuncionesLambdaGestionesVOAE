@@ -57,8 +57,6 @@ router.get("/roles", async ({ consulta }) => {
 
 router.get("/perfiles", async () => consultas.listarPerfiles());
 
-router.get("/programas", async () => consultas.listarProgramas());
-
 /* ------------------------------ Identidad ------------------------------ */
 
 router.get("/personas/{idPersona}", async ({ parametros }) => {

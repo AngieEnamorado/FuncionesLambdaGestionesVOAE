@@ -15,6 +15,21 @@ export interface SecretoBaseDatos {
   DB_USER: string;
   DB_PASSWORD: string;
   DB_PORT?: string | number;
+  /**
+   * Para un SQL Server propio (p. ej. el 10.8 de la UNAH) cuyo certificado no
+   * firma una CA publica: el certificado publico del servidor, o el de la CA
+   * que lo emitio, en PEM ("-----BEGIN CERTIFICATE-----..."). Solo se acepta
+   * ese servidor; la conexion nunca deja de validar. Azure SQL no lo lleva.
+   */
+  DB_CERTIFICADO?: string;
+  /** Nombre que trae ese certificado (CN o SAN) cuando DB_SERVER es una IP. */
+  DB_NOMBRE_CERTIFICADO?: string;
+  /**
+   * "true": cifrar pero aceptar el certificado del servidor sin validarlo,
+   * como "Confiar en el certificado de servidor" de SSMS. Solo para pruebas:
+   * db.ts lo ignora salvo que corra el servidor local (VOAE_ENTORNO=local).
+   */
+  DB_CONFIAR_CERTIFICADO?: string;
 }
 
 const ID_SECRETO = process.env.ID_SECRETO_VOAE ?? "secreto-voae";

@@ -9,6 +9,7 @@
  */
 import { consultar, consultarUna, sql, type Parametro } from "../../compartido/db";
 import { enCache } from "../../compartido/catalogos";
+import { CAMPOS_PERSONA, SEXO_LOCAL, completarUnaConRegistro, leerRegistro } from "../../compartido/registro";
 
 /* --------------------------- Tablas de referencia -------------------------
    Diminutas, casi estaticas y las pide casi toda pantalla, asi que van todas
@@ -104,32 +105,39 @@ export const listarPerfiles = () =>
     `),
   );
 
-export const listarProgramas = () =>
-  enCache("programas", () =>
-    consultar(`
-      SELECT idPrograma, nombrePrograma, siglasPrograma, descripcionPrograma,
-             estadoPrograma
-        FROM Catalogo.tblProgramasVoae
-       WHERE estadoPrograma = 1
-       ORDER BY idPrograma
-    `),
-  );
-
 /* ------------------------------- Identidad -------------------------------
    No hay tablas "Empleado" ni "Estudiante": hay una sola tblPersonas, y ser
    empleado o estudiante es un rol que la persona tiene (tblPersonaPerfilRol),
    con sus atributos en tablas de detalle 1:1. Los endpoints respetan eso: se
-   pide la persona, y aparte su detalle.                                    */
+   pide la persona, y aparte su detalle.
 
-export const obtenerPersona = (idPersona: number) =>
-  consultarUna(`
+   Desde la v2 los datos personales de un estudiante no estan en tblPersonas
+   sino en Registro (ver compartido/registro.ts): si Registro los tiene,
+   ganan; si no, quedan los locales (empleados y externos).                 */
+
+export async function obtenerPersona(idPersona: number) {
+  const persona = await consultarUna(`
     SELECT p.idPersona, p.nombrePersona, p.apellidosPersona, p.correoPersona,
-           p.sexoPersona, p.telefonoPersona, p.idCampus, c.nombreCampus,
-           p.estadoPersona, p.fechaRegistro
+           ${SEXO_LOCAL("p")} AS sexoPersona, p.idGenero, p.telefonoPersona,
+           p.idCampus, c.nombreCampus, p.estadoPersona, p.fechaRegistro, de.numeroCuenta
       FROM Catalogo.tblPersonas p
       LEFT JOIN Catalogo.tblCampus c ON c.idCampus = p.idCampus
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = p.idPersona
      WHERE p.idPersona = @idPersona
   `, { idPersona: [sql.Int, idPersona] });
+  if (!persona) return null;
+  const idCampusLocal = persona["idCampus"];
+  await completarUnaConRegistro(persona, { ...CAMPOS_PERSONA, idGenero: "idGenero", idCampus: "idCampus" });
+  // El campus de Registro llega como id: el nombre se busca aparte para que
+  // idCampus y nombreCampus no se contradigan.
+  if (persona["idCampus"] !== idCampusLocal && persona["idCampus"] != null) {
+    const campus = await consultarUna<{ nombreCampus: string }>(
+      `SELECT nombreCampus FROM Catalogo.tblCampus WHERE idCampus = @idCampus`,
+      { idCampus: [sql.Int, persona["idCampus"] as number] });
+    persona["nombreCampus"] = campus?.nombreCampus ?? null;
+  }
+  return persona;
+}
 
 /**
  * Que es esa persona y en que programa. Es el endpoint que reemplazara al
@@ -149,25 +157,52 @@ export const listarPerfilesDePersona = (idPersona: number) =>
      ORDER BY r.sistemaRol, r.nombreRol
   `, { idPersona: [sql.Int, idPersona] });
 
-export const obtenerEstudiante = (numeroCuenta: string) =>
-  consultarUna(`
-    SELECT de.idPersona, de.numeroCuenta, de.carreraEstudiante,
-           de.indicePeriodo, de.indiceGlobal, de.forma003Url, de.fotoUrl,
-           de.carnetDigitalUrl, de.matriculaVerificada,
-           de.fechaMatriculaVerificada,
-           p.nombrePersona, p.apellidosPersona, p.correoPersona,
-           p.telefonoPersona, p.sexoPersona, p.idCampus, c.nombreCampus
-      FROM Catalogo.tblDetallesEstudiantes de
-      INNER JOIN Catalogo.tblPersonas p ON p.idPersona = de.idPersona
-      LEFT JOIN Catalogo.tblCampus c ON c.idCampus = p.idCampus
-     WHERE de.numeroCuenta = @numeroCuenta
-  `, { numeroCuenta: [sql.NVarChar(15), numeroCuenta] });
+/**
+ * Un estudiante por numero de cuenta. Registro es la fuente: una cuenta que
+ * Registro conoce existe aunque todavia no tenga persona en nuestra base
+ * (idPersona null; se crea cuando hace falta, p. ej. al aprobar su grupo).
+ * Si Registro no la conoce, se cae a lo local, como cuentas de prueba.
+ */
+export async function obtenerEstudiante(numeroCuenta: string) {
+  const [registro, local] = await Promise.all([
+    leerRegistro([numeroCuenta], { estricto: true }).then((m) => m.get(numeroCuenta.trim()) ?? null),
+    consultarUna<Record<string, unknown>>(`
+      SELECT de.idPersona, de.numeroCuenta, p.nombrePersona, p.apellidosPersona, p.correoPersona,
+             p.telefonoPersona, ${SEXO_LOCAL("p")} AS sexoPersona, p.idCampus
+        FROM Catalogo.tblDetallesEstudiantes de
+        INNER JOIN Catalogo.tblPersonas p ON p.idPersona = de.idPersona
+       WHERE de.numeroCuenta = @numeroCuenta
+    `, { numeroCuenta: [sql.NVarChar(15), numeroCuenta] }),
+  ]);
+  if (!registro && !local) return null;
+
+  const idCampus = registro?.idCampus ?? (local?.["idCampus"] as number | null) ?? null;
+  const campus = idCampus === null ? null : await consultarUna<{ nombreCampus: string }>(
+    `SELECT nombreCampus FROM Catalogo.tblCampus WHERE idCampus = @idCampus`,
+    { idCampus: [sql.Int, idCampus] },
+  );
+
+  return {
+    idPersona: (local?.["idPersona"] as number | null) ?? null,
+    numeroCuenta: numeroCuenta.trim(),
+    nombrePersona: registro?.nombres ?? local?.["nombrePersona"] ?? null,
+    apellidosPersona: registro?.apellidos ?? local?.["apellidosPersona"] ?? null,
+    correoPersona: registro?.correo ?? local?.["correoPersona"] ?? null,
+    telefonoPersona: local?.["telefonoPersona"] ?? null,
+    sexoPersona: registro?.sexo ?? local?.["sexoPersona"] ?? null,
+    idCampus,
+    nombreCampus: campus?.nombreCampus ?? null,
+    carreraEstudiante: registro?.carrera ?? null,
+    matriculaVerificada: registro?.matriculado ?? false,
+    origen: registro ? "REGISTRO" : "LOCAL",
+  };
+}
 
 export const obtenerEmpleado = (numeroEmpleado: string) =>
   consultarUna(`
     SELECT dm.idPersona, dm.numeroEmpleado, dm.contratadoVoae,
            p.nombrePersona, p.apellidosPersona, p.correoPersona,
-           p.telefonoPersona, p.sexoPersona, p.idCampus, c.nombreCampus
+           p.telefonoPersona, ${SEXO_LOCAL("p")} AS sexoPersona, p.idCampus, c.nombreCampus
       FROM Catalogo.tblDetallesEmpleados dm
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = dm.idPersona
       LEFT JOIN Catalogo.tblCampus c ON c.idCampus = p.idCampus

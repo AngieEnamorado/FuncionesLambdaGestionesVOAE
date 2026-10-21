@@ -14,6 +14,13 @@ import {
 } from "../../compartido/db";
 import { enCache, invalidarCache } from "../../compartido/catalogos";
 import { conflicto, noEncontrado } from "../../compartido/errores";
+import {
+  CAMPOS_PERSONA,
+  SEXO_LOCAL,
+  completarConRegistro,
+  completarUnaConRegistro,
+  leerRegistro,
+} from "../../compartido/registro";
 
 /** Cargo 2 = Coordinador. Un indice unico filtrado permite uno solo activo por grupo. */
 export const CARGO_COORDINADOR = 2;
@@ -151,8 +158,8 @@ export async function actualizarTrimestre(
 
 /* -------------------------------- Grupos -------------------------------- */
 
-export function listarGrupos(idCampus: number | null, idRedTematica: number | null) {
-  return consultar(`
+export async function listarGrupos(idCampus: number | null, idRedTematica: number | null) {
+  const filas = await consultar(`
     SELECT g.idGrupo, g.nombreGrupo, g.descripcionGrupo, g.fechaCreacionGrupo,
            g.logoUrl, g.redesSociales, g.estadoGrupo,
            (SELECT COUNT(*) FROM Voluntariado.tblMiembrosGrupos m
@@ -172,11 +179,13 @@ export function listarGrupos(idCampus: number | null, idRedTematica: number | nu
               FROM Voluntariado.tblGruposRedesTematicas gr
              WHERE gr.idGrupo = g.idGrupo) AS idsRedesTematicas,
            co.idPersona AS idPersonaCoordinador,
-           CONCAT(pc.nombrePersona, N' ', pc.apellidosPersona) AS nombreCoordinador
+           NULLIF(LTRIM(RTRIM(CONCAT(pc.nombrePersona, N' ', pc.apellidosPersona))), N'') AS nombreCoordinador,
+           dc.numeroCuenta AS cuentaCoordinador
       FROM Voluntariado.tblGrupos g
       LEFT JOIN Voluntariado.tblMiembrosGrupos co
         ON co.idGrupo = g.idGrupo AND co.idCargo = ${CARGO_COORDINADOR} AND co.estadoMiembroGrupo = 1
       LEFT JOIN Catalogo.tblPersonas pc ON pc.idPersona = co.idPersona
+      LEFT JOIN Catalogo.tblDetallesEstudiantes dc ON dc.idPersona = co.idPersona
      WHERE g.estadoGrupo = 1
        AND (@idCampus IS NULL OR EXISTS (
              SELECT 1 FROM Voluntariado.tblGruposCampus gc
@@ -189,6 +198,8 @@ export function listarGrupos(idCampus: number | null, idRedTematica: number | nu
     idCampus: [sql.Int, idCampus],
     idRed: [sql.Int, idRedTematica],
   });
+  // El nombre del coordinador estudiante sale de Registro (una consulta para todos).
+  return completarConRegistro(filas, { nombreCoordinador: "completo" }, "cuentaCoordinador");
 }
 
 export async function obtenerGrupo(idGrupo: number) {
@@ -222,15 +233,18 @@ export async function obtenerGrupo(idGrupo: number) {
       { idGrupo: [sql.Int, idGrupo] }),
     // Junta directiva: todo miembro con cargo distinto de Miembro.
     consultar(`SELECT m.idMiembroGrupo, m.idPersona, m.idCargo, c.nombreCargo,
-                      m.anioVigencia, p.nombrePersona, p.apellidosPersona, p.correoPersona
+                      m.anioVigencia, p.nombrePersona, p.apellidosPersona, p.correoPersona,
+                      de.numeroCuenta
                  FROM Voluntariado.tblMiembrosGrupos m
                  INNER JOIN Voluntariado.tblCargos c ON c.idCargo = m.idCargo
                  INNER JOIN Catalogo.tblPersonas p ON p.idPersona = m.idPersona
+                 LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = m.idPersona
                 WHERE m.idGrupo = @idGrupo AND m.estadoMiembroGrupo = 1 AND m.idCargo <> 1
                 ORDER BY m.idCargo`,
       { idGrupo: [sql.Int, idGrupo] }),
   ]);
 
+  await completarConRegistro(junta, CAMPOS_PERSONA);
   return { ...grupo, campus, redesTematicas: redes, juntaDirectiva: junta };
 }
 
@@ -305,12 +319,11 @@ export const listarCampusDeGrupo = (idGrupo: number) =>
      ORDER BY c.nombreCampus
   `, { idGrupo: [sql.Int, idGrupo] });
 
-export const listarMiembros = (idGrupo: number, soloActivos: boolean) =>
-  consultar(`
+export const listarMiembros = async (idGrupo: number, soloActivos: boolean) => ordenarPorPersona(await completarConRegistro(await consultar(`
     SELECT m.idMiembroGrupo, m.idPersona, m.idCargo, c.nombreCargo, m.anioVigencia,
            m.esFundador, m.fechaIngreso, m.fechaBaja, m.estadoMiembroGrupo,
-           p.nombrePersona, p.apellidosPersona, p.correoPersona, p.idCampus, p.sexoPersona,
-           de.numeroCuenta, de.carreraEstudiante
+           p.nombrePersona, p.apellidosPersona, p.correoPersona, p.idCampus, ${SEXO_LOCAL("p")} AS sexoPersona,
+           de.numeroCuenta, CAST(NULL AS NVARCHAR(200)) AS carreraEstudiante
       FROM Voluntariado.tblMiembrosGrupos m
       INNER JOIN Voluntariado.tblCargos c ON c.idCargo = m.idCargo
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = m.idPersona
@@ -321,7 +334,24 @@ export const listarMiembros = (idGrupo: number, soloActivos: boolean) =>
   `, {
     idGrupo: [sql.Int, idGrupo],
     soloActivos: [sql.Bit, soloActivos],
+  }), { ...CAMPOS_PERSONA, idCampus: "idCampus" }), ["idCargo", "apellidosPersona", "nombrePersona"]);
+
+/**
+ * Ordena despues de completar con Registro: en SQL los nombres de los
+ * estudiantes vienen vacios y un ORDER BY por nombre los dejaria revueltos.
+ */
+function ordenarPorPersona<T extends Record<string, unknown>>(filas: T[], columnas: string[]): T[] {
+  return filas.sort((a, b) => {
+    for (const columna of columnas) {
+      const x = a[columna], y = b[columna];
+      const diferencia = typeof x === "number" && typeof y === "number"
+        ? x - y
+        : String(x ?? "").localeCompare(String(y ?? ""), "es");
+      if (diferencia !== 0) return diferencia;
+    }
+    return 0;
   });
+}
 
 export const existeGrupo = async (idGrupo: number): Promise<boolean> =>
   (await consultarUna(`SELECT 1 AS hay FROM Voluntariado.tblGrupos WHERE idGrupo = @idGrupo`,
@@ -358,16 +388,17 @@ export function reasignarCoordinador(idGrupo: number, idPersona: number) {
 
 /* ------------------- Solicitudes de grupos nuevos ----------------------- */
 
-export function listarSolicitudesGrupos(idEstadoFiltro: number | null, idCampus: number | null) {
-  return consultar(`
+export async function listarSolicitudesGrupos(idEstadoFiltro: number | null, idCampus: number | null) {
+  const filas = await consultar(`
     SELECT s.idSolicitudGrupoNuevo, s.nombreGrupo, s.idPersonaSolicitante,
-           p.nombrePersona, p.apellidosPersona, s.idCampus, c.nombreCampus,
+           p.nombrePersona, p.apellidosPersona, de.numeroCuenta, s.idCampus, c.nombreCampus,
            s.idEstado, e.codigoEstado, e.nombreEstado,
            s.fechaSolicitud, s.fechaResolucion, s.idGrupoCreado,
            (SELECT COUNT(*) FROM Voluntariado.tblSolicitudesMiembrosFundadores f
              WHERE f.idSolicitudGrupoNuevo = s.idSolicitudGrupoNuevo) AS totalFundadores
       FROM Voluntariado.tblSolicitudesGruposNuevos s
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = s.idPersonaSolicitante
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = s.idPersonaSolicitante
       INNER JOIN Catalogo.tblCampus c ON c.idCampus = s.idCampus
       INNER JOIN Catalogo.tblEstados e ON e.idEstado = s.idEstado
      WHERE (@idEstado IS NULL OR s.idEstado = @idEstado)
@@ -377,33 +408,35 @@ export function listarSolicitudesGrupos(idEstadoFiltro: number | null, idCampus:
     idEstado: [sql.Int, idEstadoFiltro],
     idCampus: [sql.Int, idCampus],
   });
+  return completarConRegistro(filas, CAMPOS_PERSONA);
 }
 
 export async function obtenerSolicitudGrupo(id: number) {
   const solicitud = await consultarUna(`
     SELECT s.*, e.codigoEstado, e.nombreEstado, c.nombreCampus,
-           p.nombrePersona, p.apellidosPersona, p.correoPersona
+           p.nombrePersona, p.apellidosPersona, p.correoPersona, de.numeroCuenta AS cuentaSolicitante
       FROM Voluntariado.tblSolicitudesGruposNuevos s
       INNER JOIN Catalogo.tblEstados e ON e.idEstado = s.idEstado
       INNER JOIN Catalogo.tblCampus c ON c.idCampus = s.idCampus
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = s.idPersonaSolicitante
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = s.idPersonaSolicitante
      WHERE s.idSolicitudGrupoNuevo = @id
   `, { id: [sql.Int, id] });
   if (!solicitud) return null;
 
   const parametro: Record<string, Parametro> = { id: [sql.Int, id] };
   const [fundadores, junta, actividades, adjuntos] = await Promise.all([
-    // La solicitud guarda numeros de cuenta, no personas: el nombre sale del
-    // padron solo si la cuenta ya existe como estudiante.
+    // La solicitud guarda numeros de cuenta, no personas: el nombre sale de
+    // Registro (o de nuestra base si la cuenta no esta alla).
     consultar(`SELECT f.idSolicitudMiembroFundador, f.numeroCuenta, f.matriculaValida,
-                      CONCAT(p.nombrePersona, N' ', p.apellidosPersona) AS nombre,
-                      de.carreraEstudiante
+                      NULLIF(LTRIM(RTRIM(CONCAT(p.nombrePersona, N' ', p.apellidosPersona))), N'') AS nombre,
+                      CAST(NULL AS NVARCHAR(200)) AS carreraEstudiante
                  FROM Voluntariado.tblSolicitudesMiembrosFundadores f
                  LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.numeroCuenta = f.numeroCuenta
                  LEFT JOIN Catalogo.tblPersonas p ON p.idPersona = de.idPersona
                 WHERE f.idSolicitudGrupoNuevo = @id ORDER BY f.idSolicitudMiembroFundador`, parametro),
     consultar(`SELECT j.idSolicitudJuntaDirectiva, j.numeroCuenta, j.idCargo, c.nombreCargo,
-                      CONCAT(p.nombrePersona, N' ', p.apellidosPersona) AS nombre
+                      NULLIF(LTRIM(RTRIM(CONCAT(p.nombrePersona, N' ', p.apellidosPersona))), N'') AS nombre
                  FROM Voluntariado.tblSolicitudesJuntasDirectivas j
                  INNER JOIN Voluntariado.tblCargos c ON c.idCargo = j.idCargo
                  LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.numeroCuenta = j.numeroCuenta
@@ -421,6 +454,12 @@ export async function obtenerSolicitudGrupo(id: number) {
                 WHERE a.idSolicitudGrupoNuevo = @id ORDER BY a.idAdjuntoSolicitud`, parametro),
   ]);
 
+  // Una sola ronda a Registro para solicitante, fundadores y junta.
+  await Promise.all([
+    completarConRegistro([solicitud], CAMPOS_PERSONA, "cuentaSolicitante"),
+    completarConRegistro(fundadores, { nombre: "completo", carreraEstudiante: "carrera" }),
+    completarConRegistro(junta, { nombre: "completo" }),
+  ]);
   return { ...solicitud, fundadores, juntaDirectiva: junta, actividadesProyectadas: actividades, adjuntos };
 }
 
@@ -436,8 +475,6 @@ export interface NuevaSolicitudGrupo {
   misionGrupo: string | null;
   visionGrupo: string | null;
   edadSolicitante: number | null;
-  dniSolicitante: string | null;
-  celularSolicitante: string | null;
   direccionSolicitante: string | null;
   fundadores: string[];
   juntaDirectiva: { numeroCuenta: string; idCargo: number }[];
@@ -456,12 +493,11 @@ export async function crearSolicitudGrupo(datos: NuevaSolicitudGrupo, usuario: s
       INSERT INTO Voluntariado.tblSolicitudesGruposNuevos
           (idPersonaSolicitante, idCampus, idEstado, nombreGrupo, fechaCreacionGrupo,
            colaboraOtrasUnidades, detalleColaboracion, resenaHistorica, propositoGrupo,
-           misionGrupo, visionGrupo, edadSolicitante, dniSolicitante, celularSolicitante,
-           direccionSolicitante, usuarioRegistro)
+           misionGrupo, visionGrupo, edadSolicitante, direccionSolicitante, usuarioRegistro)
       OUTPUT INSERTED.idSolicitudGrupoNuevo
       VALUES (@idPersona, @idCampus, @idEstado, @nombreGrupo, @fechaCreacion,
               @colabora, @detalleColaboracion, @resena, @proposito,
-              @mision, @vision, @edad, @dni, @celular, @direccion, @usuario)
+              @mision, @vision, @edad, @direccion, @usuario)
     `, {
       idPersona: [sql.Int, datos.idPersonaSolicitante],
       idCampus: [sql.Int, datos.idCampus],
@@ -475,8 +511,6 @@ export async function crearSolicitudGrupo(datos: NuevaSolicitudGrupo, usuario: s
       mision: [sql.NVarChar(sql.MAX), datos.misionGrupo],
       vision: [sql.NVarChar(sql.MAX), datos.visionGrupo],
       edad: [sql.TinyInt, datos.edadSolicitante],
-      dni: [sql.NVarChar(20), datos.dniSolicitante],
-      celular: [sql.NVarChar(30), datos.celularSolicitante],
       direccion: [sql.NVarChar(300), datos.direccionSolicitante],
       usuario: [sql.NVarChar(90), usuario],
     });
@@ -562,6 +596,25 @@ export async function resolverSolicitudGrupo(
 ) {
   const nuevoEstado = await idEstado("VOL_SOLICITUD_GRUPO", codigoEstado);
 
+  // Junta y fundadores son numeros de cuenta. Desde la v2 un estudiante no
+  // tiene persona en nuestra base hasta que algo la necesita: las cuentas sin
+  // persona se validan en Registro ANTES de la transaccion (leer el linked
+  // server dentro la volveria distribuida) y dentro se les crea la persona.
+  const enRegistro = new Set<string>();
+  if (codigoEstado === "APROBADA") {
+    const sinPersona = await consultar<{ numeroCuenta: string }>(`
+      SELECT c.numeroCuenta
+        FROM (SELECT numeroCuenta FROM Voluntariado.tblSolicitudesJuntasDirectivas WHERE idSolicitudGrupoNuevo = @id
+              UNION SELECT numeroCuenta FROM Voluntariado.tblSolicitudesMiembrosFundadores WHERE idSolicitudGrupoNuevo = @id) c
+       WHERE NOT EXISTS (SELECT 1 FROM Catalogo.tblDetallesEstudiantes de WHERE de.numeroCuenta = c.numeroCuenta)
+    `, { id: [sql.Int, idSolicitud] });
+    if (sinPersona.length > 0) {
+      for (const cuenta of (await leerRegistro(sinPersona.map((f) => f.numeroCuenta), { estricto: true })).keys()) {
+        enRegistro.add(cuenta);
+      }
+    }
+  }
+
   return enTransaccion(async (ejecutar) => {
     const actuales = await ejecutar<{
       idSolicitudGrupoNuevo: number; nombreGrupo: string; idCampus: number;
@@ -634,9 +687,9 @@ export async function resolverSolicitudGrupo(
         });
       }
 
-      // La junta directiva pedida se vuelve membresia real. Una cuenta que
-      // todavia no existe como persona no se inventa: se reporta y queda para
-      // que la agreguen a mano cuando la persona exista.
+      // La junta directiva pedida se vuelve membresia real. Una cuenta sin
+      // persona que Registro si conoce recibe su persona aqui; una que ni
+      // Registro conoce no se inventa: se reporta en cuentasSinPersona.
       const junta = await ejecutar<{ numeroCuenta: string; idCargo: number; idPersona: number | null }>(`
         SELECT j.numeroCuenta, j.idCargo, de.idPersona
           FROM Voluntariado.tblSolicitudesJuntasDirectivas j
@@ -661,6 +714,9 @@ export async function resolverSolicitudGrupo(
       ];
 
       for (const fila of miembros) {
+        if (fila.idPersona === null && enRegistro.has(fila.numeroCuenta.trim())) {
+          fila.idPersona = await asegurarEstudiante(ejecutar, fila.numeroCuenta.trim(), usuario);
+        }
         if (fila.idPersona === null) {
           if (!cuentasSinPersona.includes(fila.numeroCuenta)) cuentasSinPersona.push(fila.numeroCuenta);
           continue;
@@ -699,15 +755,56 @@ export async function resolverSolicitudGrupo(
   });
 }
 
+type Ejecutar = <F = Record<string, unknown>>(consulta: string, parametros?: Record<string, Parametro>) => Promise<F[]>;
+
+/**
+ * idPersona de una cuenta, creandola si no existe: tblPersonas con los datos
+ * personales en NULL (viven en Registro), tblDetallesEstudiantes y el perfil
+ * 'Estudiante de pregrado' con el rol GLOBAL ESTUDIANTE. Es lo mismo que
+ * Catalogo.spAsegurarEstudiante, escrito aqui porque el usuario de la app no
+ * tiene EXECUTE. Quien la llama ya valido la cuenta en Registro, fuera de su
+ * transaccion.
+ */
+async function asegurarEstudiante(ejecutar: Ejecutar, numeroCuenta: string, usuario: string): Promise<number> {
+  const parametros: Record<string, Parametro> = {
+    cuenta: [sql.NVarChar(15), numeroCuenta],
+    usuario: [sql.NVarChar(90), usuario],
+  };
+  const existente = await ejecutar<{ idPersona: number }>(
+    `SELECT idPersona FROM Catalogo.tblDetallesEstudiantes WHERE numeroCuenta = @cuenta`, parametros);
+  let idPersona = existente[0]?.idPersona;
+  if (idPersona === undefined) {
+    const nueva = await ejecutar<{ idPersona: number }>(`
+      INSERT INTO Catalogo.tblPersonas (usuarioRegistro) OUTPUT INSERTED.idPersona VALUES (@usuario)
+    `, parametros);
+    idPersona = nueva[0]!.idPersona;
+    await ejecutar(`
+      INSERT INTO Catalogo.tblDetallesEstudiantes (idPersona, numeroCuenta, usuarioRegistro)
+      VALUES (@idPersona, @cuenta, @usuario)
+    `, { ...parametros, idPersona: [sql.Int, idPersona] });
+  }
+  await ejecutar(`
+    INSERT INTO Catalogo.tblPersonaPerfilRol (idPersona, idPerfil, idRol, usuarioRegistro)
+    SELECT @idPersona, pf.idPerfil, r.idRol, @usuario
+      FROM Catalogo.tblPerfiles pf
+      CROSS JOIN Catalogo.tblRoles r
+     WHERE pf.nombre = N'Estudiante de pregrado'
+       AND r.sistemaRol = N'GLOBAL' AND r.nombreRol = N'ESTUDIANTE'
+       AND NOT EXISTS (SELECT 1 FROM Catalogo.tblPersonaPerfilRol x
+                        WHERE x.idPersona = @idPersona AND x.idPerfil = pf.idPerfil AND x.idRol = r.idRol)
+  `, { ...parametros, idPersona: [sql.Int, idPersona] });
+  return idPersona;
+}
+
 /* ------------------------- Solicitudes de union ------------------------- */
 
-export const listarSolicitudesUnion = (idGrupo: number, idEstadoFiltro: number | null) =>
-  consultar(`
+export const listarSolicitudesUnion = async (idGrupo: number, idEstadoFiltro: number | null) =>
+  completarConRegistro(await consultar(`
     SELECT su.idSolicitudUnion, su.idGrupo, su.idPersona, su.mensajeSolicitud,
            su.idEstado, e.codigoEstado, e.nombreEstado, su.fechaSolicitud,
            su.fechaResolucion, su.motivoResolucion,
            p.nombrePersona, p.apellidosPersona, p.correoPersona,
-           de.numeroCuenta, de.carreraEstudiante
+           de.numeroCuenta, CAST(NULL AS NVARCHAR(200)) AS carreraEstudiante
       FROM Voluntariado.tblSolicitudesUniones su
       INNER JOIN Catalogo.tblEstados e ON e.idEstado = su.idEstado
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = su.idPersona
@@ -718,7 +815,7 @@ export const listarSolicitudesUnion = (idGrupo: number, idEstadoFiltro: number |
   `, {
     idGrupo: [sql.Int, idGrupo],
     idEstado: [sql.Int, idEstadoFiltro],
-  });
+  }), CAMPOS_PERSONA);
 
 export async function crearSolicitudUnion(
   idGrupo: number,
@@ -1039,22 +1136,20 @@ export async function quitarFoto(idActividad: number, idFotoActividad: number) {
    ASISTIO traiga horas; esa regla no se repite aqui, se deja fallar y su
    mensaje sale como 409.                                                  */
 
-export const listarParticipaciones = (idActividad: number) =>
-  consultar(`
+export const listarParticipaciones = async (idActividad: number) => ordenarPorPersona(await completarConRegistro(await consultar(`
     SELECT pa.idParticipacion, pa.idPersona, pa.idGrupo, pa.tipoParticipante,
            pa.idEstado, e.codigoEstado, e.nombreEstado, pa.horasParticipacion,
            pa.fechaInscripcion, pa.fechaConfirmacion, pa.idPersonaConfirma,
            pa.validadoComoMiembro, pa.validadoMismoCampus,
-           COALESCE(pa.nombreSnapshot, CONCAT(p.nombrePersona, N' ', p.apellidosPersona)) AS nombre,
-           COALESCE(pa.sexoSnapshot, p.sexoPersona) AS sexo,
-           de.numeroCuenta, de.carreraEstudiante
+           NULLIF(LTRIM(RTRIM(CONCAT(p.nombrePersona, N' ', p.apellidosPersona))), N'') AS nombre,
+           ${SEXO_LOCAL("p")} AS sexo,
+           de.numeroCuenta, CAST(NULL AS NVARCHAR(200)) AS carreraEstudiante
       FROM Voluntariado.tblParticipaciones pa
       INNER JOIN Catalogo.tblEstados e ON e.idEstado = pa.idEstado
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = pa.idPersona
       LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = pa.idPersona
      WHERE pa.idActividad = @idActividad
-     ORDER BY nombre
-  `, { idActividad: [sql.Int, idActividad] });
+  `, { idActividad: [sql.Int, idActividad] }), { nombre: "completo", sexo: "sexo", carreraEstudiante: "carrera" }), ["nombre"]);
 
 export interface LineaAsistencia {
   idPersona: number;
@@ -1115,16 +1210,15 @@ export async function registrarAsistencia(
         `, parametros);
         actualizadas++;
       } else {
-        // El snapshot del nombre se guarda al inscribir para que el historico
-        // no cambie si la persona despues se renombra o se da de baja.
+        // Sin snapshot de nombre ni sexo: desde la v2 son datos de Registro y
+        // no se copian (se leen en vivo al listar). El SELECT sobre la persona
+        // solo garantiza que exista.
         await ejecutar(`
           INSERT INTO Voluntariado.tblParticipaciones
               (idActividad, idGrupo, idPersona, idPeriodo, idEstado, tipoParticipante,
-               horasParticipacion, idPersonaConfirma, fechaConfirmacion,
-               nombreSnapshot, sexoSnapshot, usuarioRegistro)
+               horasParticipacion, idPersonaConfirma, fechaConfirmacion, usuarioRegistro)
           SELECT @idActividad, @idGrupo, @idPersona, @idPeriodo, @idEstado, @tipo,
-                 @horas, @idPersonaConfirma, SYSDATETIME(),
-                 CONCAT(p.nombrePersona, N' ', p.apellidosPersona), p.sexoPersona, @usuario
+                 @horas, @idPersonaConfirma, SYSDATETIME(), @usuario
             FROM Catalogo.tblPersonas p
            WHERE p.idPersona = @idPersona
         `, parametros);
@@ -1162,6 +1256,16 @@ export async function inscribirEnActividad(idActividad: number, idPersona: numbe
     idEstado("VOL_ACTIVIDAD", "APROBADA"),
   ]);
 
+  // El campus del estudiante vive en Registro: se lee antes de la transaccion
+  // para marcar validadoMismoCampus sin consultar el linked server dentro.
+  const persona = await completarUnaConRegistro(await consultarUna<Record<string, unknown>>(`
+    SELECT p.idCampus, de.numeroCuenta
+      FROM Catalogo.tblPersonas p
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = p.idPersona
+     WHERE p.idPersona = @idPersona
+  `, { idPersona: [sql.Int, idPersona] }), { idCampus: "idCampus" });
+  const idCampusPersona = (persona?.["idCampus"] as number | null | undefined) ?? null;
+
   return enTransaccion(async (ejecutar) => {
     const actividades = await ejecutar<{ idGrupoOrganizador: number; idPeriodo: number; idEstado: number }>(`
       SELECT idGrupoOrganizador, idPeriodo, idEstado FROM Voluntariado.tblActividades
@@ -1198,6 +1302,7 @@ export async function inscribirEnActividad(idActividad: number, idPersona: numbe
       idEstado: [sql.Int, estadoInscrito],
       tipo: [sql.NVarChar(25), tipoParticipante],
       esMiembro: [sql.Bit, esMiembro],
+      idCampusPersona: [sql.Int, idCampusPersona],
       usuario: [sql.NVarChar(90), usuario],
     };
 
@@ -1217,11 +1322,11 @@ export async function inscribirEnActividad(idActividad: number, idPersona: numbe
       await ejecutar(`
         INSERT INTO Voluntariado.tblParticipaciones
             (idActividad, idGrupo, idPersona, idPeriodo, idEstado, tipoParticipante,
-             nombreSnapshot, sexoSnapshot, validadoComoMiembro, validadoMismoCampus, usuarioRegistro)
+             validadoComoMiembro, validadoMismoCampus, usuarioRegistro)
         SELECT @idActividad, @idGrupo, @idPersona, @idPeriodo, @idEstado, @tipo,
-               CONCAT(p.nombrePersona, N' ', p.apellidosPersona), p.sexoPersona, @esMiembro,
+               @esMiembro,
                CASE WHEN EXISTS (SELECT 1 FROM Voluntariado.tblGruposCampus gc
-                                  WHERE gc.idGrupo = @idGrupo AND gc.idCampus = p.idCampus)
+                                  WHERE gc.idGrupo = @idGrupo AND gc.idCampus = @idCampusPersona)
                     THEN 1 ELSE 0 END,
                @usuario
           FROM Catalogo.tblPersonas p
@@ -1601,12 +1706,11 @@ export function guardarInformeEconomico(
  * ASISTIO. Se cuentan tanto las organizadas por el grupo como aquellas en
  * las que figura como coorganizador.
  */
-export const listarElegiblesDiploma = (
+export const listarElegiblesDiploma = async (
   idGrupo: number,
   idTrimestre: number | null,
   umbralPorcentaje: number,
-) =>
-  consultar(`
+) => ordenarPorPersona(await completarConRegistro(await consultar(`
     WITH actividadesGrupo AS (
         SELECT a.idActividad
           FROM Voluntariado.tblActividades a
@@ -1620,7 +1724,7 @@ export const listarElegiblesDiploma = (
     ),
     total AS (SELECT COUNT(*) AS actividadesGrupo FROM actividadesGrupo)
     SELECT pa.idPersona,
-           COALESCE(pa.nombreSnapshot, CONCAT(p.nombrePersona, N' ', p.apellidosPersona)) AS nombre,
+           NULLIF(LTRIM(RTRIM(CONCAT(p.nombrePersona, N' ', p.apellidosPersona))), N'') AS nombre,
            de.numeroCuenta,
            t.actividadesGrupo,
            COUNT(*) AS actividadesAsistidas,
@@ -1636,15 +1740,14 @@ export const listarElegiblesDiploma = (
       LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = pa.idPersona
       CROSS JOIN total t
      WHERE e.contextoEstado = N'VOL_PARTICIPACION' AND e.codigoEstado = N'ASISTIO'
-     GROUP BY pa.idPersona, pa.nombreSnapshot, p.nombrePersona, p.apellidosPersona,
+     GROUP BY pa.idPersona, p.nombrePersona, p.apellidosPersona,
               de.numeroCuenta, t.actividadesGrupo
     HAVING CAST(100.0 * COUNT(*) / NULLIF(t.actividadesGrupo, 0) AS DECIMAL(5,2)) >= @umbral
-     ORDER BY porcentajeParticipacion DESC, nombre
   `, {
     idGrupo: [sql.Int, idGrupo],
     idTrimestre: [sql.Int, idTrimestre],
     umbral: [sql.Decimal(5, 2), umbralPorcentaje],
-  });
+  }), { nombre: "completo" }), ["nombre"]).sort((a, b) => Number(b["porcentajeParticipacion"]) - Number(a["porcentajeParticipacion"]));
 
 export const emitirDiploma = (
   datos: {
@@ -1677,8 +1780,8 @@ export const emitirDiploma = (
     usuario: [sql.NVarChar(90), usuario],
   });
 
-export const listarDiplomas = (idGrupo: number) =>
-  consultar(`
+export const listarDiplomas = async (idGrupo: number) =>
+  completarConRegistro(await consultar(`
     SELECT d.idDiploma, d.idPersona, d.ventanaDiploma, d.actividadesGrupo,
            d.actividadesAsistidas, d.porcentajeParticipacion, d.emitidoDiploma,
            d.fechaEmision, d.archivoUrl,
@@ -1688,7 +1791,7 @@ export const listarDiplomas = (idGrupo: number) =>
       LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = d.idPersona
      WHERE d.idGrupo = @idGrupo
      ORDER BY d.fechaEmision DESC
-  `, { idGrupo: [sql.Int, idGrupo] });
+  `, { idGrupo: [sql.Int, idGrupo] }), CAMPOS_PERSONA);
 
 /**
  * Porcentaje de participacion de cada miembro activo, elegible o no. Misma
@@ -1696,8 +1799,8 @@ export const listarDiplomas = (idGrupo: number) =>
  * ASISTIO como numerador), pero sin filtrar por umbral y opcionalmente para
  * todos los grupos: es la vista del panel de diplomas.
  */
-export const listarParticipacionMiembros = (idGrupo: number | null, idTrimestre: number | null) =>
-  consultar(`
+export const listarParticipacionMiembros = async (idGrupo: number | null, idTrimestre: number | null) =>
+  ordenarPorPersona(await completarConRegistro(await consultar(`
     WITH ejecutadas AS (
         SELECT g.idGrupo, a.idActividad
           FROM Voluntariado.tblGrupos g
@@ -1711,7 +1814,7 @@ export const listarParticipacionMiembros = (idGrupo: number | null, idTrimestre:
     ),
     base AS (
         SELECT m.idGrupo, g.nombreGrupo, m.idPersona,
-               CONCAT(p.nombrePersona, N' ', p.apellidosPersona) AS nombre,
+               NULLIF(LTRIM(RTRIM(CONCAT(p.nombrePersona, N' ', p.apellidosPersona))), N'') AS nombre,
                de.numeroCuenta,
                (SELECT STRING_AGG(c.nombreCampus, N', ')
                   FROM Voluntariado.tblGruposCampus gc
@@ -1740,11 +1843,12 @@ export const listarParticipacionMiembros = (idGrupo: number | null, idTrimestre:
            CAST(COALESCE(100.0 * actividadesAsistidas / NULLIF(actividadesGrupo, 0), 0) AS DECIMAL(5,2))
              AS porcentajeParticipacion
       FROM base
-     ORDER BY nombreGrupo, porcentajeParticipacion DESC, nombre
   `, {
     idGrupo: [sql.Int, idGrupo],
     idTrimestre: [sql.Int, idTrimestre],
-  });
+  }), { nombre: "completo" }), ["nombre"])
+    .sort((a, b) => String(a["nombreGrupo"]).localeCompare(String(b["nombreGrupo"]), "es")
+      || Number(b["porcentajeParticipacion"]) - Number(a["porcentajeParticipacion"]));
 
 /* ------------------------------- Personas -------------------------------
    Sin capa de sesion, el portal del estudiante pregunta por una persona
@@ -1752,9 +1856,10 @@ export const listarParticipacionMiembros = (idGrupo: number | null, idTrimestre:
    horas, mis inscripciones y mis solicitudes.                             */
 
 /** Estudiantes con alguna relacion con Voluntariado: alimenta el selector de persona de prueba. */
-export const listarPersonasVoluntariado = () =>
-  consultar(`
-    SELECT p.idPersona, p.nombrePersona, p.apellidosPersona, de.numeroCuenta, de.carreraEstudiante,
+export const listarPersonasVoluntariado = async () =>
+  (await completarConRegistro(await consultar(`
+    SELECT p.idPersona, p.nombrePersona, p.apellidosPersona, de.numeroCuenta,
+           CAST(NULL AS NVARCHAR(200)) AS carreraEstudiante,
            (SELECT STRING_AGG(g.nombreGrupo, N', ')
               FROM Voluntariado.tblMiembrosGrupos m
               INNER JOIN Voluntariado.tblGrupos g ON g.idGrupo = m.idGrupo
@@ -1770,13 +1875,17 @@ export const listarPersonasVoluntariado = () =>
         OR EXISTS (SELECT 1 FROM Voluntariado.tblSolicitudesUniones su WHERE su.idPersona = p.idPersona)
         OR EXISTS (SELECT 1 FROM Voluntariado.tblSolicitudesGruposNuevos s
                     WHERE s.idPersonaSolicitante = p.idPersona)
-     ORDER BY esCoordinador DESC, p.nombrePersona, p.apellidosPersona
-  `);
+  `), CAMPOS_PERSONA))
+    .sort((a, b) => Number(b["esCoordinador"]) - Number(a["esCoordinador"])
+      || String(a["nombrePersona"] ?? "").localeCompare(String(b["nombrePersona"] ?? ""), "es")
+      || String(a["apellidosPersona"] ?? "").localeCompare(String(b["apellidosPersona"] ?? ""), "es"));
 
 export async function obtenerResumenPersona(idPersona: number) {
   const persona = await consultarUna(`
-    SELECT p.idPersona, p.nombrePersona, p.apellidosPersona, p.correoPersona, p.sexoPersona,
-           p.idCampus, c.nombreCampus, de.numeroCuenta, de.carreraEstudiante,
+    SELECT p.idPersona, p.nombrePersona, p.apellidosPersona, p.correoPersona,
+           ${SEXO_LOCAL("p")} AS sexoPersona,
+           p.idCampus, c.nombreCampus, de.numeroCuenta,
+           CAST(NULL AS NVARCHAR(200)) AS carreraEstudiante,
            (SELECT COALESCE(SUM(pa.horasParticipacion), 0) FROM Voluntariado.tblParticipaciones pa
              WHERE pa.idPersona = p.idPersona AND pa.idEstado = ${ID_ESTADO_ASISTIO}) AS horasConfirmadas
       FROM Catalogo.tblPersonas p
@@ -1785,6 +1894,14 @@ export async function obtenerResumenPersona(idPersona: number) {
      WHERE p.idPersona = @idPersona
   `, { idPersona: [sql.Int, idPersona] });
   if (!persona) return null;
+  const idCampusLocal = persona["idCampus"];
+  await completarUnaConRegistro(persona, { ...CAMPOS_PERSONA, idCampus: "idCampus" });
+  if (persona["idCampus"] !== idCampusLocal && persona["idCampus"] != null) {
+    const campus = await consultarUna<{ nombreCampus: string }>(
+      `SELECT nombreCampus FROM Catalogo.tblCampus WHERE idCampus = @idCampus`,
+      { idCampus: [sql.Int, persona["idCampus"] as number] });
+    persona["nombreCampus"] = campus?.nombreCampus ?? null;
+  }
 
   const grupos = await consultar(`
     SELECT m.idGrupo, g.nombreGrupo, m.idCargo, c.nombreCargo, m.esFundador, m.fechaIngreso,

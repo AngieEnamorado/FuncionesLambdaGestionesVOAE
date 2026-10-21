@@ -42,8 +42,10 @@ await build({
     name: "dobles-voluntariado",
     setup(b) {
       // Los dobles importan los modulos reales; esos imports no se cambian.
-      b.onResolve({ filter: /compartido\/(db|archivos)$/ }, (args) => {
+      // Tambien "./db" importado desde src/compartido (p. ej. registro.ts).
+      b.onResolve({ filter: /(compartido\/|^\.\/)(db|archivos)$/ }, (args) => {
         if (args.importer.startsWith(dobles)) return undefined;
+        if (args.path.startsWith("./") && !/[\\/]src[\\/]compartido[\\/]/.test(args.importer)) return undefined;
         return { path: join(dobles, `${args.path.endsWith("db") ? "db" : "archivos"}.ts`) };
       });
     },
