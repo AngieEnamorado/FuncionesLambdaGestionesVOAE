@@ -13,6 +13,7 @@
 import { consultar, consultarUna, enTransaccion, sql, type Parametro } from "../../compartido/db";
 import { noEncontrado } from "../../compartido/errores";
 import { Filtros, usuarioParam, type Ejecutor } from "./entrada";
+import { conDatosDeRegistro, ordenarPorNombre } from "./registro";
 
 export const CATEGORIAS_SEXO = ["masculino", "femenino", "mixto"] as const;
 export const TIPOS_GRUPO = ["deportivo", "artistico"] as const;
@@ -234,16 +235,15 @@ export async function listarIntegrantes(idGrupo: number, periodo: number | null)
 
   const parametros: Record<string, Parametro> = { id: [sql.Int, idGrupo], periodo: [sql.Int, periodo] };
   const columnas = `
-    s.idSolicitud, s.idPersona, p.nombrePersona, p.apellidosPersona, p.correoPersona, p.telefonoPersona,
+    s.idSolicitud, s.idPersona,
     de.numeroCuenta, s.idPeriodo, s.esEquipo, s.fechaInscripcion,
     s.idGrupo AS idGrupoOrigen, gor.nombreGrupo AS nombreGrupoOrigen, gor.idCampus, c.nombreCampus`;
   const desde = `
     INNER JOIN Procad.tblGrupos gor    ON gor.idGrupo = s.idGrupo
     INNER JOIN Catalogo.tblCampus c    ON c.idCampus = gor.idCampus
-    INNER JOIN Catalogo.tblPersonas p  ON p.idPersona = s.idPersona
      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = s.idPersona`;
 
-  const integrantes = grupo.esSeleccion
+  const filas = grupo.esSeleccion
     ? await consultar(`
         SELECT ${columnas}
           FROM Procad.tblSeleccionIntegrantes si
@@ -251,7 +251,6 @@ export async function listarIntegrantes(idGrupo: number, periodo: number | null)
         ${desde}
          WHERE si.idGrupoSeleccion = @id
            AND (@periodo IS NULL OR s.idPeriodo = @periodo)
-         ORDER BY c.nombreCampus, p.apellidosPersona
       `, parametros)
     : await consultar(`
         SELECT ${columnas},
@@ -266,9 +265,13 @@ export async function listarIntegrantes(idGrupo: number, periodo: number | null)
          WHERE s.idGrupo = @id
            AND e.contextoEstado = N'PROCAD_SOLICITUD' AND e.codigoEstado = N'APROBADO'
            AND (@periodo IS NULL OR s.idPeriodo = @periodo)
-         ORDER BY p.apellidosPersona, p.nombrePersona
       `, parametros).then((filas) => filas.map((fila) => conListas(fila, ["selecciones"])));
 
+  // Una seleccion junta varios campus: se agrupa por campus antes del nombre.
+  const integrantes = ordenarPorNombre(
+    await conDatosDeRegistro(filas),
+    grupo.esSeleccion ? (f) => String(f["nombreCampus"] ?? "") : undefined,
+  );
   return { ...grupo, integrantes };
 }
 
@@ -386,17 +389,21 @@ export async function cambiarAccesoPersona(idPersona: number, activo: boolean) {
   return listarAccesos({ grupo: null, campus: null, persona: idPersona, incluirInactivos: true });
 }
 
-/** Beneficiarios PROSENE: elegibles automaticos segun Procad.vwElegibilidad. */
-export function listarProsene(incluirInactivos: boolean) {
-  return consultar(`
-    SELECT b.idPersona, p.nombrePersona, p.apellidosPersona, p.correoPersona, p.idCampus,
-           c.nombreCampus, de.numeroCuenta, de.carreraEstudiante,
+/**
+ * Beneficiarios PROSENE: elegibles automaticos segun Procad.vwElegibilidad.
+ * Son estudiantes: en la v2 su campus y carrera tambien salen de Registro.
+ */
+export async function listarProsene(incluirInactivos: boolean) {
+  const filas = await consultar(`
+    SELECT b.idPersona, de.numeroCuenta,
            b.estadoBeneficio AS activo, b.observacionBeneficio, b.fechaRegistro
       FROM Procad.tblBeneficiariosProsene b
-     INNER JOIN Catalogo.tblPersonas p  ON p.idPersona = b.idPersona
      INNER JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = b.idPersona
-      LEFT JOIN Catalogo.tblCampus c    ON c.idCampus = p.idCampus
     ${incluirInactivos ? "" : "WHERE b.estadoBeneficio = 1"}
-     ORDER BY p.apellidosPersona, p.nombrePersona
   `);
+  return ordenarPorNombre(await conDatosDeRegistro(filas, (r) => ({
+    idCampus: r.idCampus,
+    nombreCampus: r.centro,
+    carreraEstudiante: r.carrera,
+  })));
 }

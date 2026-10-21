@@ -15,6 +15,8 @@ export interface SecretoBaseDatos {
   DB_USER: string;
   DB_PASSWORD: string;
   DB_PORT?: string | number;
+  DB_TRUST_SERVER_CERTIFICATE?: string | boolean;
+  DB_REQUEST_TIMEOUT_MS?: string | number;
 }
 
 const ID_SECRETO = process.env.ID_SECRETO_VOAE ?? "secreto-voae";

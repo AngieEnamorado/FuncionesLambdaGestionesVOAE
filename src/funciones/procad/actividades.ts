@@ -6,16 +6,17 @@
  * - tgrActividadesTipoCoherente: el tipo de actividad debe estar habilitado para ESE grupo y activo.
  * - tgrActividadesValidadoraEsAdmin: valida solo un ADMINISTRADOR_PROCAD.
  * - tgrActividadesNoValidarPeriodoCerrado: no se valida en un periodo cerrado.
- * - tgrAsistenciasSoloValidadas, tgrAsistenciasMismoGrupo,
- *   tgrAsistenciasRequiereMatriculaVerificada, tgrAsistenciasExcusaValidada:
- *   lista solo sobre actividades VALIDADA, del mismo grupo y periodo, con
- *   matricula verificada, y excusas con justificacion y validador autorizado.
+ * - tgrAsistenciasSoloValidadas, tgrAsistenciasMismoGrupo, tgrAsistenciasExcusaValidada:
+ *   lista solo sobre actividades VALIDADA, del mismo grupo y periodo, y
+ *   excusas con justificacion y validador autorizado.
+ * - Procad.spRegistrarAsistencia: la matricula de quien entra a la lista, contra Registro (v2).
  * - Procad.spGenerarActividadesSerie: la recurrencia. Se llama, no se reimplementa.
  * - Procad.spActivarNuevoPeriodo: la arrastre de integrantes al periodo nuevo.
  */
-import { consultar, consultarUna, ejecutarProcedimiento, enTransaccion, sql, type Parametro } from "../../compartido/db";
+import { consultar, consultarUna, ejecutarProcedimiento, enTransaccion, sql } from "../../compartido/db";
 import { conflicto, noEncontrado, solicitudInvalida } from "../../compartido/errores";
 import { CONTEXTO, Filtros, idEstado, usuarioParam } from "./entrada";
+import { conDatosDeRegistro, estudiantesDeRegistro, ordenarPorNombre } from "./registro";
 
 export const ESTADOS_ACTIVIDAD = ["PENDIENTE_VALIDACION", "VALIDADA", "RECHAZADA"] as const;
 export const DECISIONES_ACTIVIDAD = ["VALIDADA", "RECHAZADA"] as const;
@@ -204,7 +205,7 @@ export async function validarActividad(idActividad: number, v: Validacion) {
 
 export async function listarAsistencia(idActividad: number) {
   const actividad = await obtenerActividad(idActividad);
-  const asistencias = await consultar(`
+  const filas = await consultar(`
     SELECT x.idAsistencia, x.idSolicitud, s.idPersona, p.nombrePersona, p.apellidosPersona, de.numeroCuenta,
            x.asistio, x.esExcusado, x.justificacionExcusa, x.idPersonaValidaExcusa, x.fechaAsistencia,
            CASE WHEN x.asistio IS NULL THEN N'INSCRITO'
@@ -216,8 +217,8 @@ export async function listarAsistencia(idActividad: number) {
      INNER JOIN Catalogo.tblPersonas p  ON p.idPersona = s.idPersona
       LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = s.idPersona
      WHERE x.idActividad = @id
-     ORDER BY p.apellidosPersona, p.nombrePersona
   `, { id: [sql.Int, idActividad] });
+  const asistencias = ordenarPorNombre(await conDatosDeRegistro(filas));
   return { actividad, asistencias };
 }
 
@@ -233,44 +234,52 @@ export interface MarcaAsistencia {
 /**
  * Pase de lista: crea o actualiza una fila por estudiante. En las actividades
  * de una serie nadie se inscribe y el director pasa lista directo contra el
- * grupo, asi que la fila puede no existir todavia. Si una sola marca viola un
- * trigger se revierte todo el pase, para no dejar la lista a medias.
+ * grupo, asi que la fila puede no existir todavia.
+ *
+ * v2: cada marca pasa por Procad.spRegistrarAsistencia, que valida en Registro
+ * la matricula de quien entra por primera vez. Ese SP no puede ir dentro de
+ * una transaccion de la aplicacion (lee el linked server), asi que el pase ya
+ * no es todo o nada. Para no dejar la lista a medias en el caso comun, antes
+ * de escribir se revisa en UNA consulta a Registro la matricula de todos los
+ * que entran por primera vez; si alguno no esta matriculado no se escribe nada.
  */
 export async function registrarAsistencia(idActividad: number, marcas: MarcaAsistencia[], usuario: string) {
-  await enTransaccion(async (ejecutar) => {
-    const existe = await ejecutar(
-      "SELECT idActividad FROM Procad.tblActividades WHERE idActividad = @id",
-      { id: [sql.Int, idActividad] },
-    );
-    if (!existe[0]) throw noEncontrado(`No existe la actividad ${idActividad}.`);
+  const existe = await consultarUna(
+    "SELECT idActividad FROM Procad.tblActividades WHERE idActividad = @id",
+    { id: [sql.Int, idActividad] },
+  );
+  if (!existe) throw noEncontrado(`No existe la actividad ${idActividad}.`);
 
-    for (const m of marcas) {
-      const parametros: Record<string, Parametro> = {
-        actividad: [sql.Int, idActividad],
-        solicitud: [sql.Int, m.idSolicitud],
-        asistio: [sql.Bit, m.asistio],
-        excusado: [sql.Bit, m.esExcusado],
-        justificacion: [sql.NVarChar(300), m.justificacionExcusa],
-        valida: [sql.Int, m.idPersonaValidaExcusa],
-        usuario: usuarioParam(usuario),
-      };
-      await ejecutar(`
-        IF EXISTS (SELECT 1 FROM Procad.tblAsistencias WITH (UPDLOCK, HOLDLOCK)
-                    WHERE idActividad = @actividad AND idSolicitud = @solicitud)
-          UPDATE Procad.tblAsistencias
-             SET asistio = @asistio, esExcusado = @excusado, justificacionExcusa = @justificacion,
-                 idPersonaValidaExcusa = @valida,
-                 fechaAsistencia = CASE WHEN @asistio IS NULL THEN NULL ELSE SYSDATETIME() END
-           WHERE idActividad = @actividad AND idSolicitud = @solicitud;
-        ELSE
-          INSERT INTO Procad.tblAsistencias
-            (idActividad, idSolicitud, asistio, esExcusado, justificacionExcusa, idPersonaValidaExcusa,
-             fechaAsistencia, usuarioRegistro)
-          VALUES (@actividad, @solicitud, @asistio, @excusado, @justificacion, @valida,
-                  CASE WHEN @asistio IS NULL THEN NULL ELSE SYSDATETIME() END, @usuario);
-      `, parametros);
-    }
-  });
+  const ids = marcas.map((m) => m.idSolicitud);
+  const nuevas = ids.length === 0 ? [] : await consultar<{ idSolicitud: number; numeroCuenta: string | null }>(`
+    SELECT s.idSolicitud, de.numeroCuenta
+      FROM Procad.tblSolicitudes s
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = s.idPersona
+     WHERE s.idSolicitud IN (SELECT CAST(value AS INT) FROM STRING_SPLIT(@ids, N','))
+       AND NOT EXISTS (SELECT 1 FROM Procad.tblAsistencias x
+                        WHERE x.idActividad = @actividad AND x.idSolicitud = s.idSolicitud)
+  `, { ids: [sql.NVarChar(sql.MAX), ids.join(",")], actividad: [sql.Int, idActividad] });
+
+  const registro = await estudiantesDeRegistro(nuevas.map((n) => n.numeroCuenta));
+  const sinMatricula = nuevas.filter((n) => !(n.numeroCuenta && registro.get(n.numeroCuenta)?.matriculado));
+  if (sinMatricula.length > 0) {
+    throw conflicto(
+      `No tienen matricula vigente en Registro las solicitudes ${sinMatricula.map((n) => n.idSolicitud).join(", ")}: `
+      + "no se registro ninguna marca.",
+    );
+  }
+
+  for (const m of marcas) {
+    await ejecutarProcedimiento("Procad.spRegistrarAsistencia", {
+      idActividad: [sql.Int, idActividad],
+      idSolicitud: [sql.Int, m.idSolicitud],
+      asistio: [sql.Bit, m.asistio],
+      esExcusado: [sql.Bit, m.esExcusado],
+      justificacionExcusa: [sql.NVarChar(300), m.justificacionExcusa],
+      idPersonaValidaExcusa: [sql.Int, m.idPersonaValidaExcusa],
+      usuarioRegistro: usuarioParam(usuario),
+    });
+  }
 
   return listarAsistencia(idActividad);
 }
@@ -370,8 +379,9 @@ interface ResumenActivacion {
  * califico. No cambia cual es el periodo activo: eso es de Catalogo. Aqui
  * solo se devuelve su resumen.
  *
- * La version anterior del SP (migracion 2026-09-23 sin aplicar) no devuelve
- * resumen; en ese caso se cuenta a mano cuantos integrantes quedaron.
+ * La version del SP de DbVoae v2 (DbVoae_v2_registro.sql) no devuelve
+ * resumen; en ese caso se cuenta a mano cuantos integrantes quedaron. En la
+ * v2 el SP tambien deja fuera a quien ya no esta matriculado en Registro.
  */
 export async function activarPeriodo(idPeriodoAnterior: number, idPeriodoNuevo: number, usuario: string) {
   const [resumen] = await ejecutarProcedimiento<ResumenActivacion>("Procad.spActivarNuevoPeriodo", {

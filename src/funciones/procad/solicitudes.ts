@@ -13,10 +13,16 @@
  * ningun trigger lo cubre: una solicitud solo se resuelve si esta PENDIENTE
  * (§12 del diseno: los estados finales no se revierten a mano), y el log de
  * estados lo escribe la aplicacion porque ningun trigger lo hace.
+ *
+ * v2: la matricula ya no la valida un trigger sino Procad.spAprobarSolicitud,
+ * que la consulta en Registro. Por eso aprobar pasa por ese SP (que tambien
+ * escribe el log), y nunca dentro de una transaccion de la aplicacion: el SP
+ * lee el linked server y eso la volveria distribuida (MSDTC).
  */
-import { consultar, consultarUna, enTransaccion, sql, type Parametro } from "../../compartido/db";
+import { consultar, consultarUna, ejecutarProcedimiento, enTransaccion, sql, type Parametro } from "../../compartido/db";
 import { conflicto, noEncontrado, solicitudInvalida } from "../../compartido/errores";
 import { Filtros, CONTEXTO, idEstado, usuarioParam, type Ejecutor } from "./entrada";
+import { academicos, coincide, conDatosDeRegistro } from "./registro";
 
 export const ESTADOS_SOLICITUD = [
   "PENDIENTE", "APROBADO", "NO_CUMPLE_REQUISITO", "OBSERVADO", "EXPULSADO",
@@ -64,18 +70,12 @@ export async function listarSolicitudes(f: FiltrosSolicitudes) {
     .si(f.tipoGrupo, "tipoGrupo", sql.NVarChar(20), "tg.nombreTipoGrupo = @tipoGrupo")
     .si(f.grupo, "grupo", sql.Int, "s.idGrupo = @grupo")
     .si(f.estado, "estado", sql.NVarChar(40), "e.codigoEstado = @estado")
-    .si(f.periodo, "periodo", sql.Int, "s.idPeriodo = @periodo")
-    .si(
-      f.texto === null ? null : `%${f.texto}%`, "texto", sql.NVarChar(210),
-      "(p.nombrePersona + N' ' + p.apellidosPersona LIKE @texto OR de.numeroCuenta LIKE @texto)",
-    );
+    .si(f.periodo, "periodo", sql.Int, "s.idPeriodo = @periodo");
 
   // Trae tambien lo de la ficha (contacto, posicion, instrumento, experiencia):
   // la tabla del panel lo muestra sin abrir cada solicitud.
   const filas = await consultar<Record<string, unknown>>(`
     SELECT ${COLUMNAS_SOLICITUD},
-           p.telefonoPersona, p.sexoPersona,
-           de.carreraEstudiante, de.indicePeriodo, de.indiceGlobal, de.matriculaVerificada,
            pe.anioPeriodo, pe.numeroPac,
            d.contactoEmergenciaNombre, d.contactoEmergenciaTelefono,
            po.nombrePosicion, i.nombreInstrumento, d.nivelExperiencia, d.alergia,
@@ -93,7 +93,13 @@ export async function listarSolicitudes(f: FiltrosSolicitudes) {
      ORDER BY s.fechaRegistro DESC
   `, filtros.parametros);
 
-  return filas.map((fila) => ({
+  // El nombre ya no esta en la base: la busqueda por texto se hace despues de
+  // traerlo de Registro, sobre las filas que dejaron pasar los demas filtros.
+  const completas = (await conDatosDeRegistro(filas, academicos))
+    .filter((fila) => f.texto === null
+      || coincide(f.texto, fila["nombrePersona"], fila["apellidosPersona"], fila["numeroCuenta"]));
+
+  return completas.map((fila) => ({
     ...fila,
     adjuntos: typeof fila["adjuntos"] === "string" ? JSON.parse(fila["adjuntos"]) : [],
   }));
@@ -103,19 +109,19 @@ export async function listarSolicitudes(f: FiltrosSolicitudes) {
 export async function obtenerSolicitud(idSolicitud: number) {
   const parametros: Record<string, Parametro> = { id: [sql.Int, idSolicitud] };
 
-  const solicitud = await consultarUna(`
+  const local = await consultarUna(`
     SELECT ${COLUMNAS_SOLICITUD},
-           p.telefonoPersona, p.sexoPersona,
-           de.carreraEstudiante, de.indicePeriodo, de.indiceGlobal, de.matriculaVerificada,
-           de.fotoUrl, de.carnetDigitalUrl, de.forma003Url,
            s.idUltimoPeriodo,
            s.idPersonaProponeCondicionado, s.idPersonaAutorizaCondicionado
     ${DESDE_SOLICITUD}
      WHERE s.idSolicitud = @id
   `, { ...parametros });
-  if (!solicitud) throw noEncontrado(`No existe la solicitud ${idSolicitud}.`);
+  if (!local) throw noEncontrado(`No existe la solicitud ${idSolicitud}.`);
 
-  const [detalle, adjuntos, historial] = await Promise.all([
+  // La foto y el carnet no vienen aqui: salen de otro linked server y se
+  // piden aparte, con GET /solicitudes/{id}/foto.
+  const [[solicitud], detalle, adjuntos, historial] = await Promise.all([
+    conDatosDeRegistro([local], academicos),
     consultarUna(`
       SELECT d.idDetalleSolicitud, d.contactoEmergenciaNombre, d.contactoEmergenciaTelefono,
              d.aceptoReglamento, d.idPosicion, po.nombrePosicion, d.alergia,
@@ -144,6 +150,28 @@ export async function obtenerSolicitud(idSolicitud: number) {
   ]);
 
   return { ...solicitud, detalle, adjuntos, historial };
+}
+
+/**
+ * Foto y carnet digital del estudiante, tal como los devuelve el sistema de
+ * fotos (Catalogo.spObtenerFotoEstudiante, segundo linked server). Va aparte
+ * de la ficha porque es pesado y lento: el panel la pide solo al abrirla.
+ */
+export async function obtenerFotoDeSolicitud(idSolicitud: number) {
+  const solicitud = await consultarUna<{ numeroCuenta: string | null }>(`
+    SELECT de.numeroCuenta
+      FROM Procad.tblSolicitudes s
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = s.idPersona
+     WHERE s.idSolicitud = @id
+  `, { id: [sql.Int, idSolicitud] });
+  if (!solicitud) throw noEncontrado(`No existe la solicitud ${idSolicitud}.`);
+  if (!solicitud.numeroCuenta) throw noEncontrado(`La solicitud ${idSolicitud} no tiene numero de cuenta.`);
+
+  const [foto] = await ejecutarProcedimiento("Catalogo.spObtenerFotoEstudiante", {
+    numeroCuenta: [sql.NVarChar(15), solicitud.numeroCuenta],
+  });
+  if (!foto) throw noEncontrado(`El sistema de fotos no tiene foto para la cuenta ${solicitud.numeroCuenta}.`);
+  return { numeroCuenta: solicitud.numeroCuenta, ...foto };
 }
 
 /** Lee y BLOQUEA la solicitud: dos resoluciones simultaneas se serializan aqui. */
@@ -193,13 +221,18 @@ export interface Resolucion {
 
 /**
  * Aprobar, observar o marcar como no cumple. Lo que haga falta para aprobar
- * (matricula verificada, indice o condicionado con doble firma, una sola
- * solicitud activa en el periodo) lo exige la base al hacer el UPDATE.
+ * (indice o condicionado con doble firma, una sola solicitud activa en el
+ * periodo) lo exige la base al hacer el UPDATE; la matricula, el SP.
  */
 export async function resolverSolicitud(idSolicitud: number, r: Resolucion, usuario: string) {
   if (r.decision === "OBSERVADO" && r.observacion === null) {
     // RF-12: al observar hay que decir que corregir.
     throw solicitudInvalida("Para observar una solicitud hay que indicar en observacion que debe corregirse.");
+  }
+
+  if (r.decision === "APROBADO") {
+    await aprobarSolicitud(idSolicitud, r, usuario);
+    return obtenerSolicitud(idSolicitud);
   }
 
   await enTransaccion(async (ejecutar) => {
@@ -227,6 +260,45 @@ export async function resolverSolicitud(idSolicitud: number, r: Resolucion, usua
   });
 
   return obtenerSolicitud(idSolicitud);
+}
+
+/**
+ * Aprobacion por Procad.spAprobarSolicitud, sin transaccion propia (ver
+ * cabecera). Sin el UPDLOCK de las demas decisiones, dos aprobaciones
+ * simultaneas podrian pasar ambas el chequeo de PENDIENTE; el resultado es el
+ * mismo estado, y el log queda doble.
+ *
+ * El SP reescribe esCondicionado y las dos firmas: se le pasan las que la
+ * solicitud ya tiene para no borrar un condicionado autorizado.
+ */
+async function aprobarSolicitud(idSolicitud: number, r: Resolucion, usuario: string) {
+  const actual = await consultarUna<{
+    codigoEstado: string;
+    esCondicionado: boolean;
+    idPersonaProponeCondicionado: number | null;
+    idPersonaAutorizaCondicionado: number | null;
+  }>(`
+    SELECT e.codigoEstado, s.esCondicionado, s.idPersonaProponeCondicionado, s.idPersonaAutorizaCondicionado
+      FROM Procad.tblSolicitudes s
+     INNER JOIN Catalogo.tblEstados e ON e.idEstado = s.idEstado
+     WHERE s.idSolicitud = @id
+  `, { id: [sql.Int, idSolicitud] });
+  if (!actual) throw noEncontrado(`No existe la solicitud ${idSolicitud}.`);
+  if (actual.codigoEstado !== "PENDIENTE") {
+    throw conflicto(
+      `La solicitud ${idSolicitud} esta en estado ${actual.codigoEstado}: solo se resuelve una solicitud PENDIENTE.`,
+    );
+  }
+
+  await ejecutarProcedimiento("Procad.spAprobarSolicitud", {
+    idSolicitud: [sql.Int, idSolicitud],
+    idPersonaAprueba: [sql.Int, r.idPersona],
+    esCondicionado: [sql.Bit, actual.esCondicionado],
+    idPersonaPropone: [sql.Int, actual.esCondicionado ? actual.idPersonaProponeCondicionado : null],
+    idPersonaAutoriza: [sql.Int, actual.esCondicionado ? actual.idPersonaAutorizaCondicionado : null],
+    observacion: [sql.NVarChar(300), r.observacion],
+    usuarioRegistro: usuarioParam(usuario),
+  });
 }
 
 /**
@@ -266,7 +338,7 @@ export async function marcarEquipo(idSolicitud: number, esEquipo: boolean) {
 /** POR_RECONFIRMAR: arrastrados PENDIENTE al periodo nuevo, esperando que sus firmantes repitan el flujo. */
 export const ESTADOS_CONDICIONADO = ["PROPUESTO", "AUTORIZADO", "POR_RECONFIRMAR"] as const;
 
-export function listarCondicionados(f: {
+export async function listarCondicionados(f: {
   estado: (typeof ESTADOS_CONDICIONADO)[number] | null;
   grupo: number | null;
   campus: number | null;
@@ -286,9 +358,8 @@ export function listarCondicionados(f: {
 
   // ant: la solicitud del periodo anterior, si fue condicionada. Sus firmantes
   // son quienes tienen que decidir si repiten la propuesta y la autorizacion.
-  return consultar(`
+  const filas = await consultar(`
     SELECT ${COLUMNAS_SOLICITUD},
-           de.indiceGlobal,
            s.idPersonaProponeCondicionado,
            pp.nombrePersona AS nombrePropone, pp.apellidosPersona AS apellidosPropone,
            s.idPersonaAutorizaCondicionado,
@@ -308,6 +379,7 @@ export function listarCondicionados(f: {
     ${filtros.where}
      ORDER BY s.esCondicionado, s.fechaActualizacion DESC
   `, filtros.parametros);
+  return conDatosDeRegistro(filas, (r) => ({ indiceGlobal: r.indiceGlobal }));
 }
 
 export async function proponerCondicionado(idSolicitud: number, idPersonaPropone: number) {
@@ -406,18 +478,19 @@ const DESDE_EXPULSION = `
  INNER JOIN Catalogo.tblPersonas ps       ON ps.idPersona = x.idPersonaSolicita
   LEFT JOIN Catalogo.tblPersonas pr       ON pr.idPersona = x.idPersonaResuelve`;
 
-export function listarExpulsiones(f: { estado: string | null; grupo: number | null; campus: number | null }) {
+export async function listarExpulsiones(f: { estado: string | null; grupo: number | null; campus: number | null }) {
   const filtros = new Filtros()
     .si(f.estado, "estado", sql.NVarChar(40), "ex.codigoEstado = @estado")
     .si(f.grupo, "grupo", sql.Int, "s.idGrupo = @grupo")
     .si(f.campus, "campus", sql.Int, "g.idCampus = @campus");
 
-  return consultar(`
+  const filas = await consultar(`
     SELECT ${COLUMNAS_EXPULSION}
     ${DESDE_EXPULSION}
     ${filtros.where}
      ORDER BY x.fechaRegistro DESC
   `, filtros.parametros);
+  return conDatosDeRegistro(filas);
 }
 
 export async function obtenerExpulsion(idExpulsion: number) {
@@ -427,7 +500,8 @@ export async function obtenerExpulsion(idExpulsion: number) {
      WHERE x.idSolicitudExpulsion = @id
   `, { id: [sql.Int, idExpulsion] });
   if (!fila) throw noEncontrado(`No existe la solicitud de expulsion ${idExpulsion}.`);
-  return fila;
+  const [completa] = await conDatosDeRegistro([fila]);
+  return completa;
 }
 
 export interface NuevaExpulsion {
@@ -534,15 +608,16 @@ const DESDE_MATRICULA = `
   LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = me.idPersona
  INNER JOIN Catalogo.tblPersonas pa  ON pa.idPersona = me.idPersonaAutoriza`;
 
-export function listarMatriculasExcepcionales(f: { periodo: number | null; soloActivas: boolean }) {
+export async function listarMatriculasExcepcionales(f: { periodo: number | null; soloActivas: boolean }) {
   const filtros = new Filtros().si(f.periodo, "periodo", sql.Int, "me.idPeriodo = @periodo");
   if (f.soloActivas) filtros.siempre("me.estadoExcepcion = 1");
-  return consultar(`
+  const filas = await consultar(`
     SELECT ${COLUMNAS_MATRICULA}
     ${DESDE_MATRICULA}
     ${filtros.where}
      ORDER BY me.fechaRegistro DESC
   `, filtros.parametros);
+  return conDatosDeRegistro(filas);
 }
 
 export interface NuevaMatriculaExcepcional {
@@ -580,9 +655,11 @@ export async function crearMatriculaExcepcional(m: NuevaMatriculaExcepcional, us
     usuario: usuarioParam(usuario),
   });
 
-  return consultarUna(`
+  const creada = await consultar(`
     SELECT ${COLUMNAS_MATRICULA}
     ${DESDE_MATRICULA}
      WHERE me.idMatriculaExcepcional = @id
   `, { id: [sql.Int, filas[0]!.id] });
+  const [completa] = await conDatosDeRegistro(creada);
+  return completa ?? null;
 }

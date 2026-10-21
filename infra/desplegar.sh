@@ -28,10 +28,12 @@ MEMORIA_MB=512
 # Los dominios escriben en varias tablas por peticion y aguantan mas que una
 # lectura de catalogo, asi que se les da mas margen. Reporteria agrega sobre
 # tablas completas: mas memoria (en Lambda tambien compra CPU) y 29 s, que es
-# lo mas que deja esperar la HTTP API antes de cortar a los 30.
+# lo mas que deja esperar la HTTP API antes de cortar a los 30. Procad
+# consulta Registro por linked server en casi todo listado: 25 s.
 case "$DOMINIO" in
   catalogo)   TIMEOUT_S=10 ;;
   reporteria) TIMEOUT_S=29; MEMORIA_MB=1024 ;;
+  procad)     TIMEOUT_S=25 ;;
   *)          TIMEOUT_S=15 ;;
 esac
 

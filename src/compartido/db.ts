@@ -9,6 +9,13 @@
  * El techo del sistema es la base, de 1 vCore, no esta capa: el pool es
  * pequenio a proposito y la contencion se hace con concurrencia reservada por
  * funcion, no abriendo mas conexiones.
+ *
+ * Para el SQL Server de la universidad (red privada, certificado propio y
+ * consultas que pasan por linked servers) el secreto puede traer, opcionales:
+ *   DB_TRUST_SERVER_CERTIFICATE: "true" acepta un certificado autofirmado.
+ *   DB_REQUEST_TIMEOUT_MS: mas tiempo por consulta; tiene que quedar por
+ *     debajo del timeout de la Lambda.
+ * Sin ellas todo queda como en Azure.
  */
 import sql from "mssql";
 import { obtenerSecreto } from "./secretos";
@@ -31,7 +38,7 @@ async function conectar(): Promise<sql.ConnectionPool> {
     port: secreto.DB_PORT ? Number(secreto.DB_PORT) : 1433,
     options: {
       encrypt: true, // obligatorio en Azure SQL
-      trustServerCertificate: false,
+      trustServerCertificate: String(secreto.DB_TRUST_SERVER_CERTIFICATE).toLowerCase() === "true",
       // Las fechas viajan como texto ISO en JSON; leerlas en UTC evita que el
       // huso de la Lambda (UTC) y el de Honduras (UTC-6) se contradigan.
       useUTC: true,
@@ -44,7 +51,7 @@ async function conectar(): Promise<sql.ConnectionPool> {
     // Si la base serverless esta pausada, reanudar tarda; que el intento
     // falle antes del timeout de la Lambda para poder responder 503.
     connectionTimeout: 8_000,
-    requestTimeout: 8_000,
+    requestTimeout: secreto.DB_REQUEST_TIMEOUT_MS ? Number(secreto.DB_REQUEST_TIMEOUT_MS) : 8_000,
   });
 
   // Un pool que se cae no debe quedar cacheado: la proxima invocacion tiene

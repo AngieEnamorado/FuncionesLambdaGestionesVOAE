@@ -18,10 +18,27 @@ describe("GET /solicitudes", () => {
     assert.equal(codigo, 200);
     const { texto, parametros } = llamadaCon(/FROM Procad\.tblSolicitudes s/);
     assert.deepEqual(parametros, {
-      campus: 2, tipoGrupo: "deportivo", estado: "PENDIENTE", periodo: 5, texto: "%ana%",
+      campus: 2, tipoGrupo: "deportivo", estado: "PENDIENTE", periodo: 5,
     });
     assert.match(texto, /g\.idCampus = @campus/);
     assert.doesNotMatch(texto, /ana/);
+  });
+
+  test("busca por nombre con los datos de Registro, sin importar tildes", async () => {
+    responderPor([
+      [/FROM Procad\.tblSolicitudes s/, [
+        { idSolicitud: 1, numeroCuenta: "20201000001" },
+        { idSolicitud: 2, numeroCuenta: "20201000002" },
+      ]],
+      [/Registro\.spObtenerEstudiantes/, [
+        { numeroCuenta: "20201000001", primerNombre: "Ana", segundoNombre: "Lucia", primerApellido: "Lopez", segundoApellido: null },
+        { numeroCuenta: "20201000002", primerNombre: "Mario", segundoNombre: null, primerApellido: "Diaz", segundoApellido: null },
+      ]],
+    ]);
+    const { cuerpo } = await invocar(handler, "GET", "/v1/procad/solicitudes?q=lucía");
+    assert.deepEqual(cuerpo.map((s: { idSolicitud: number }) => s.idSolicitud), [1]);
+    assert.equal(cuerpo[0].nombrePersona, "Ana Lucia");
+    assert.equal(llamadaCon(/Registro\.spObtenerEstudiantes/).parametros["cuentas"], "20201000001,20201000002");
   });
 
   test("sin filtros no filtra nada", async () => {
@@ -80,15 +97,47 @@ describe("POST /solicitudes/{id}/resolucion", () => {
       [/FROM Procad\.tblSolicitudes s/, [SOLICITUD]],
     ]);
 
-  test("aprueba, y deja el cambio en el log con el estado anterior", async () => {
-    pendiente();
+  test("aprueba por spAprobarSolicitud, que valida la matricula y escribe el log", async () => {
+    responderPor([
+      [/SELECT e\.codigoEstado, s\.esCondicionado/, [{ codigoEstado: "PENDIENTE", esCondicionado: false }]],
+      [/FROM Procad\.tblSolicitudes s/, [SOLICITUD]],
+    ]);
     const { codigo } = await invocar(handler, "POST", "/v1/procad/solicitudes/7/resolucion", {
       decision: "aprobado", idPersona: 12,
     });
 
     assert.equal(codigo, 200);
+    const sp = llamadaCon(/^Procad\.spAprobarSolicitud$/);
+    assert.equal(sp.parametros["idSolicitud"], 7);
+    assert.equal(sp.parametros["idPersonaAprueba"], 12);
+    assert.equal(sp.parametros["esCondicionado"], false);
+    assert.equal(cuantasCon(/UPDATE Procad\.tblSolicitudes/), 0);
+    assert.equal(cuantasCon(/INSERT INTO Procad\.tblLogsEstadosSolicitudes/), 0);
+  });
+
+  test("al aprobar un condicionado le pasa sus firmas al SP para no borrarlas", async () => {
+    responderPor([
+      [/SELECT e\.codigoEstado, s\.esCondicionado/, [{
+        codigoEstado: "PENDIENTE", esCondicionado: true,
+        idPersonaProponeCondicionado: 30, idPersonaAutorizaCondicionado: 31,
+      }]],
+    ]);
+    await invocar(handler, "POST", "/v1/procad/solicitudes/7/resolucion", { decision: "APROBADO", idPersona: 12 });
+    const sp = llamadaCon(/spAprobarSolicitud/);
+    assert.equal(sp.parametros["esCondicionado"], true);
+    assert.equal(sp.parametros["idPersonaPropone"], 30);
+    assert.equal(sp.parametros["idPersonaAutoriza"], 31);
+  });
+
+  test("observar sigue en una transaccion y deja el log con el estado anterior", async () => {
+    pendiente();
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/solicitudes/7/resolucion", {
+      decision: "observado", idPersona: 12, observacion: "Falta la constancia",
+    });
+
+    assert.equal(codigo, 200);
     const update = llamadaCon(/UPDATE Procad\.tblSolicitudes/);
-    assert.equal(update.parametros["decision"], "APROBADO");
+    assert.equal(update.parametros["decision"], "OBSERVADO");
     assert.match(update.texto, /contextoEstado = N'PROCAD_SOLICITUD'/);
     const log = llamadaCon(/INSERT INTO Procad\.tblLogsEstadosSolicitudes/);
     assert.equal(log.parametros["idEstadoAnterior"], 17);
@@ -127,11 +176,11 @@ describe("POST /solicitudes/{id}/resolucion", () => {
     assert.equal(cuantasCon(/UPDATE/), 0);
   });
 
-  test("si un trigger rechaza la aprobacion, su mensaje llega como 409", async () => {
-    const mensaje = "El estudiante debe tener la matricula verificada para ser aprobado en el grupo.";
+  test("si el SP rechaza la aprobacion, su mensaje llega como 409", async () => {
+    const mensaje = "El estudiante no tiene matricula vigente en Registro; no se puede aprobar.";
     responderPor([
-      [/WITH \(UPDLOCK\)/, [{ idEstado: 17, codigoEstado: "PENDIENTE", esCondicionado: false }]],
-      [/UPDATE Procad\.tblSolicitudes/, () => { throw errorDeTrigger(mensaje); }],
+      [/SELECT e\.codigoEstado, s\.esCondicionado/, [{ codigoEstado: "PENDIENTE", esCondicionado: false }]],
+      [/spAprobarSolicitud/, () => { throw errorDeTrigger(mensaje); }],
     ]);
 
     const { codigo, cuerpo } = await invocar(handler, "POST", "/v1/procad/solicitudes/7/resolucion", {

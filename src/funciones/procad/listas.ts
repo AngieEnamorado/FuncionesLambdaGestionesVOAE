@@ -12,10 +12,13 @@
  * - tgrListasPreferencialesNoModificarEnviada / tgrDetallesListasNoModificarEnviada:
  *   una lista ENVIADA ya no cambia.
  * - ukListaPreferencial_GrupoPeriodoEvaluado: una lista por grupo y periodo evaluado.
+ * - Procad.spGenerarListaPreferencial (v2): deja fuera, y les quita el rol
+ *   INTEGRANTE, a los elegibles que ya no estan matriculados en Registro.
  */
-import { consultar, consultarUna, enTransaccion, sql } from "../../compartido/db";
+import { consultar, consultarUna, ejecutarProcedimiento, enTransaccion, sql } from "../../compartido/db";
 import { conflicto, noEncontrado } from "../../compartido/errores";
 import { CONTEXTO, Filtros, idEstado, usuarioParam } from "./entrada";
+import { conDatosDeRegistro, ordenarPorNombre } from "./registro";
 
 export const ESTADOS_LISTA = ["GENERADA", "ENVIADA"] as const;
 
@@ -56,69 +59,50 @@ export async function obtenerLista(idLista: number) {
   `, { id: [sql.Int, idLista] });
   if (!lista) throw noEncontrado(`No existe la lista preferencial ${idLista}.`);
 
-  const detalles = await consultar(`
-    SELECT d.idListaDetalle, d.idSolicitud, s.idPersona, p.nombrePersona, p.apellidosPersona,
-           de.numeroCuenta, de.carreraEstudiante, d.actividadesAsistidas
+  const filas = await consultar(`
+    SELECT d.idListaDetalle, d.idSolicitud, s.idPersona,
+           de.numeroCuenta, d.actividadesAsistidas
       FROM Procad.tblDetallesListasPreferenciales d
      INNER JOIN Procad.tblSolicitudes s ON s.idSolicitud = d.idSolicitud
-     INNER JOIN Catalogo.tblPersonas p  ON p.idPersona = s.idPersona
       LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = s.idPersona
      WHERE d.idLista = @id
-     ORDER BY p.apellidosPersona, p.nombrePersona
   `, { id: [sql.Int, idLista] });
+  const detalles = ordenarPorNombre(await conDatosDeRegistro(filas, (r) => ({ carreraEstudiante: r.carrera })));
 
   return { ...lista, detalles };
 }
 
 /**
  * Genera la lista del grupo para el periodo evaluado con los elegibles de
- * Procad.vwElegibilidad en este momento. El campus sale del grupo.
+ * Procad.vwElegibilidad en este momento, por Procad.spGenerarListaPreferencial.
+ * El SP consulta Registro, asi que va sin transaccion propia. Su id sale por
+ * OUTPUT; como solo hay una lista por grupo y periodo evaluado, se busca por
+ * esa llave en vez de leer el parametro de salida.
  */
 export async function generarLista(
   g: { idGrupo: number; idPeriodoEvaluado: number; idPeriodoAplicacion: number },
   usuario: string,
 ) {
-  const idLista = await enTransaccion(async (ejecutar) => {
-    const grupo = await ejecutar<{ idCampus: number }>(
-      "SELECT idCampus FROM Procad.tblGrupos WHERE idGrupo = @grupo",
-      { grupo: [sql.Int, g.idGrupo] },
-    );
-    if (!grupo[0]) throw noEncontrado(`No existe el grupo ${g.idGrupo}.`);
+  const grupo = await consultarUna(
+    "SELECT idGrupo FROM Procad.tblGrupos WHERE idGrupo = @grupo",
+    { grupo: [sql.Int, g.idGrupo] },
+  );
+  if (!grupo) throw noEncontrado(`No existe el grupo ${g.idGrupo}.`);
 
-    const filas = await ejecutar<{ id: number }>(`
-      INSERT INTO Procad.tblListasPreferenciales
-        (idGrupo, idPeriodoEvaluado, idPeriodoAplicacion, idCampus, idEstado, usuarioRegistro)
-      VALUES (@grupo, @evaluado, @aplicacion, @campus, ${idEstado(CONTEXTO.lista, "generada")}, @usuario);
-      SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
-    `, {
-      grupo: [sql.Int, g.idGrupo],
-      evaluado: [sql.Int, g.idPeriodoEvaluado],
-      aplicacion: [sql.Int, g.idPeriodoAplicacion],
-      campus: [sql.Int, grupo[0].idCampus],
-      generada: [sql.NVarChar(40), "GENERADA"],
-      usuario: usuarioParam(usuario),
-    });
-    const id = filas[0]!.id;
-
-    await ejecutar(`
-      INSERT INTO Procad.tblDetallesListasPreferenciales (idLista, idSolicitud, actividadesAsistidas, usuarioRegistro)
-      SELECT @lista, el.idSolicitud, el.actividadesAsistidas, @usuario
-        FROM Procad.vwElegibilidad el
-       WHERE el.idGrupo = @grupo AND el.idPeriodo = @evaluado AND el.elegible = 1;
-
-      UPDATE Procad.tblListasPreferenciales
-         SET cantidadElegibles = (SELECT COUNT(*) FROM Procad.tblDetallesListasPreferenciales WHERE idLista = @lista)
-       WHERE idLista = @lista;
-    `, {
-      lista: [sql.Int, id],
-      grupo: [sql.Int, g.idGrupo],
-      evaluado: [sql.Int, g.idPeriodoEvaluado],
-      usuario: usuarioParam(usuario),
-    });
-    return id;
+  await ejecutarProcedimiento("Procad.spGenerarListaPreferencial", {
+    idGrupo: [sql.Int, g.idGrupo],
+    idPeriodoEvaluado: [sql.Int, g.idPeriodoEvaluado],
+    idPeriodoAplicacion: [sql.Int, g.idPeriodoAplicacion],
+    usuarioRegistro: usuarioParam(usuario),
+    idLista: [sql.Int, null],
   });
 
-  return obtenerLista(idLista);
+  const creada = await consultarUna<{ idLista: number }>(
+    "SELECT idLista FROM Procad.tblListasPreferenciales WHERE idGrupo = @grupo AND idPeriodoEvaluado = @evaluado",
+    { grupo: [sql.Int, g.idGrupo], evaluado: [sql.Int, g.idPeriodoEvaluado] },
+  );
+  if (!creada) throw noEncontrado(`No se genero la lista del grupo ${g.idGrupo}.`);
+  return obtenerLista(creada.idLista);
 }
 
 /** Marca la lista como enviada a Registro. Desde ahi los triggers la congelan. */

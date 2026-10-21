@@ -92,6 +92,8 @@ router.get("/solicitudes", async ({ consulta }) =>
 
 router.get("/solicitudes/{id}", async (peticion) => solicitudes.obtenerSolicitud(idDeRuta(peticion)));
 
+router.get("/solicitudes/{id}/foto", async (peticion) => solicitudes.obtenerFotoDeSolicitud(idDeRuta(peticion)));
+
 router.post("/solicitudes/{id}/resolucion", async (peticion) => {
   const { cuerpo } = peticion;
   return solicitudes.resolverSolicitud(

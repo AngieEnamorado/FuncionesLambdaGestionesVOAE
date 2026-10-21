@@ -104,7 +104,7 @@ describe("Asistencia", () => {
     ],
   };
 
-  test("POST crea o actualiza una fila por estudiante", async () => {
+  test("POST pasa cada marca por spRegistrarAsistencia", async () => {
     responderPor([
       [/SELECT idActividad FROM Procad\.tblActividades/, [{ idActividad: 11 }]],
       [/FROM Procad\.tblActividades a/, [ACTIVIDAD]],
@@ -113,10 +113,28 @@ describe("Asistencia", () => {
 
     assert.equal(codigo, 200);
     assert.equal(cuerpo.actividad.idActividad, 11);
-    assert.equal(cuantasCon(/IF EXISTS .*tblAsistencias/s), 2);
-    const excusada = llamadas.filter((l) => /IF EXISTS/.test(l.texto))[1]!;
-    assert.equal(excusada.parametros["excusado"], true);
-    assert.equal(excusada.parametros["valida"], 20);
+    assert.equal(cuantasCon(/^Procad\.spRegistrarAsistencia$/), 2);
+    const excusada = llamadas.filter((l) => l.texto === "Procad.spRegistrarAsistencia")[1]!;
+    assert.equal(excusada.parametros["esExcusado"], true);
+    assert.equal(excusada.parametros["idPersonaValidaExcusa"], 20);
+  });
+
+  test("si alguien nuevo en la lista no esta matriculado, no se escribe ninguna marca", async () => {
+    responderPor([
+      [/SELECT idActividad FROM Procad\.tblActividades/, [{ idActividad: 11 }]],
+      [/NOT EXISTS \(SELECT 1 FROM Procad\.tblAsistencias/, [
+        { idSolicitud: 1, numeroCuenta: "20201000001" },
+        { idSolicitud: 2, numeroCuenta: "20201000002" },
+      ]],
+      [/Registro\.spObtenerEstudiantes/, [
+        { numeroCuenta: "20201000001", matriculado: true },
+        { numeroCuenta: "20201000002", matriculado: false },
+      ]],
+    ]);
+    const { codigo, cuerpo } = await invocar(handler, "POST", "/v1/procad/actividades/11/asistencia", marcas);
+    assert.equal(codigo, 409);
+    assert.match(cuerpo.error, /solicitudes 2:/);
+    assert.equal(cuantasCon(/spRegistrarAsistencia/), 0);
   });
 
   test("sin estudiantes es 400", async () => {
@@ -135,7 +153,7 @@ describe("Asistencia", () => {
     const mensaje = "La inscripcion y el pase de lista solo se permiten sobre actividades VALIDADAS.";
     responderPor([
       [/SELECT idActividad FROM Procad\.tblActividades/, [{ idActividad: 11 }]],
-      [/IF EXISTS/, () => { throw errorDeTrigger(mensaje); }],
+      [/spRegistrarAsistencia/, () => { throw errorDeTrigger(mensaje); }],
     ]);
     const { codigo, cuerpo } = await invocar(handler, "POST", "/v1/procad/actividades/11/asistencia", marcas);
     assert.equal(codigo, 409);

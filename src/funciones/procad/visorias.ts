@@ -14,6 +14,7 @@
 import { consultar, consultarUna, enTransaccion, sql, type Parametro } from "../../compartido/db";
 import { conflicto, noEncontrado } from "../../compartido/errores";
 import { Filtros, usuarioParam } from "./entrada";
+import { conDatosDeRegistro, ordenarPorNombre } from "./registro";
 
 const COLUMNAS_VISORIA = `
   v.idVisoria, v.idPeriodo, v.idCampus, c.nombreCampus, v.fechaVisoria,
@@ -62,17 +63,16 @@ export async function obtenerVisoria(idVisoria: number) {
   `, { id: [sql.Int, idVisoria] });
   if (!visoria) throw noEncontrado(`No existe la visoria ${idVisoria}.`);
 
-  const citados = await consultar(`
-    SELECT s.idSolicitud, s.idPersona, p.nombrePersona, p.apellidosPersona, p.correoPersona, de.numeroCuenta,
+  const filas = await consultar(`
+    SELECT s.idSolicitud, s.idPersona, de.numeroCuenta,
            s.idGrupo, g.nombreGrupo, e.codigoEstado
       FROM Procad.tblSolicitudes s
-     INNER JOIN Catalogo.tblPersonas p ON p.idPersona = s.idPersona
       LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = s.idPersona
      INNER JOIN Procad.tblGrupos g     ON g.idGrupo = s.idGrupo
      INNER JOIN Catalogo.tblEstados e  ON e.idEstado = s.idEstado
      WHERE s.idVisoriaAsignada = @id
-     ORDER BY g.nombreGrupo, p.apellidosPersona
   `, { id: [sql.Int, idVisoria] });
+  const citados = ordenarPorNombre(await conDatosDeRegistro(filas), (f) => String(f["nombreGrupo"] ?? ""));
 
   return { ...visoria, estudiantes: citados };
 }
