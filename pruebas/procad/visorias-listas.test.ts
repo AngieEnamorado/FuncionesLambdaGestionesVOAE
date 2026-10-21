@@ -135,3 +135,52 @@ describe("Listas preferenciales", () => {
     assert.equal(cuerpo.detalles.length, 2);
   });
 });
+
+describe("Visorias con grupo y estado (columnas del 2026-09-23)", () => {
+  test("POST crea la visoria del grupo en BORRADOR", async () => {
+    responderPor([
+      [/INSERT INTO Procad\.tblVisorias/, [{ id: 2 }]],
+      [/FROM Procad\.tblVisorias v/, [{ idVisoria: 2, estadoVisoria: "BORRADOR" }]],
+    ]);
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/visorias", {
+      idPeriodo: 3, idCampus: 1, fechaVisoria: "2026-10-15", idGrupo: 4,
+    });
+    assert.equal(codigo, 201);
+    const insert = llamadaCon(/INSERT INTO Procad\.tblVisorias/);
+    assert.equal(insert.parametros["grupo"], 4);
+    assert.match(insert.texto, /N'BORRADOR'/);
+  });
+
+  test("programar pasa de BORRADOR a PROGRAMADA", async () => {
+    responderPor([
+      [/SELECT estadoVisoria FROM Procad\.tblVisorias WITH/, [{ estadoVisoria: "BORRADOR" }]],
+      [/FROM Procad\.tblVisorias v/, [{ idVisoria: 2, estadoVisoria: "PROGRAMADA" }]],
+    ]);
+    const { codigo, cuerpo } = await invocar(handler, "POST", "/v1/procad/visorias/2/programar");
+    assert.equal(codigo, 200);
+    assert.equal(cuerpo.estadoVisoria, "PROGRAMADA");
+    assert.match(llamadaCon(/UPDATE Procad\.tblVisorias/).texto, /N'PROGRAMADA'/);
+  });
+
+  test("programar una ya programada es 409", async () => {
+    responderPor([[/SELECT estadoVisoria FROM/, [{ estadoVisoria: "PROGRAMADA" }]]]);
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/visorias/2/programar");
+    assert.equal(codigo, 409);
+    assert.equal(cuantasCon(/UPDATE/), 0);
+  });
+
+  test("programar una que no existe es 404", async () => {
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/visorias/2/programar");
+    assert.equal(codigo, 404);
+  });
+
+  test("GET filtra por estado y grupo", async () => {
+    await invocar(handler, "GET", "/v1/procad/visorias?estado=borrador&grupo=4");
+    assert.deepEqual(llamadaCon(/FROM Procad\.tblVisorias v/).parametros, { grupo: 4, estado: "BORRADOR" });
+  });
+
+  test("un estado de visoria que no existe es 400", async () => {
+    const { codigo } = await invocar(handler, "GET", "/v1/procad/visorias?estado=CANCELADA");
+    assert.equal(codigo, 400);
+  });
+});

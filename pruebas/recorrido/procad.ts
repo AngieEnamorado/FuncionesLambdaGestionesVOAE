@@ -270,9 +270,15 @@ async function rondaPrincipal(b: Base): Promise<void> {
     { idGrupo: g, idPeriodo: b.p1, minimoActividades: 1 }, 200, (c) => c.minimoActividades === 1);
 
   // Actividad puntual, validacion y pase de lista.
-  const act = await paso("el encargado reporta una actividad", "POST", "/actividades",
-    { idGrupo: g, idPeriodo: b.p1, fechaActividad: "2090-02-02", idTipoActividad: b.tiposActividad[0], descripcionActividad: "Ensayo general" },
-    201, (c) => c.codigoEstado === "PENDIENTE_VALIDACION");
+  const act = await paso("el encargado reporta una actividad con todo su detalle", "POST", "/actividades", {
+    idGrupo: g, idPeriodo: b.p1, fechaActividad: "2090-02-02", idTipoActividad: b.tiposActividad[0],
+    tituloActividad: "Ensayo general", horaActividad: "17:30", lugarActividad: "Auditorio Juan Lindo",
+    horasAbonadas: 2.5, justificacionActividad: "Preparacion del concierto de fin de periodo", idPersonaReporta: b.dir,
+    adjuntos: [{ nombreArchivo: "lista.pdf", urlArchivo: "actividades/lista.pdf" }],
+  }, 201, (c) =>
+    (c.codigoEstado === "PENDIENTE_VALIDACION" && c.tituloActividad === "Ensayo general" && c.horaActividad === "17:30"
+      && Number(c.horasAbonadas) === 2.5 && c.nombreReporta === "Diego" && c.adjuntos.length === 1)
+    || JSON.stringify(c).slice(0, 200));
   await paso("la admin la valida", "POST", `/actividades/${act.idActividad}/validacion`,
     { decision: "VALIDADA", idPersonaValidadora: b.adm }, 200, (c) => c.codigoEstado === "VALIDADA");
   await paso("pase de lista: Juan presente, Maria excusada", "POST", `/actividades/${act.idActividad}/asistencia`, {
@@ -291,8 +297,12 @@ async function rondaPrincipal(b: Base): Promise<void> {
   }, 201, (c) => c.actividadesGeneradas === esperadas || `genero ${c.actividadesGeneradas}`);
 
   // Visoria.
-  const vis = await paso("crea una visoria", "POST", "/visorias",
-    { idPeriodo: b.p1, idCampus: 1, fechaVisoria: "2090-01-20", horaVisoria: "08:00", idLugarVisoria: b.lugar }, 201);
+  const vis = await paso("crea la visoria del grupo, en borrador", "POST", "/visorias",
+    { idPeriodo: b.p1, idCampus: 1, fechaVisoria: "2090-01-20", horaVisoria: "08:00", idLugarVisoria: b.lugar, idGrupo: g }, 201,
+    (c) => c.estadoVisoria === "BORRADOR" && c.nombreGrupo === "Coro Recorrido UNAH");
+  await paso("la programa", "POST", `/visorias/${vis.idVisoria}/programar`, undefined, 200,
+    (c) => c.estadoVisoria === "PROGRAMADA");
+  await paso("programarla otra vez se rechaza", "POST", `/visorias/${vis.idVisoria}/programar`, undefined, 409);
   await paso("cita a Sofia", "POST", `/visorias/${vis.idVisoria}/citados`, { solicitudes: [s.sofia] }, 200,
     (c) => c.estudiantes.length === 1);
 

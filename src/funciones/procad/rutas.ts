@@ -288,8 +288,31 @@ router.post("/actividades", async ({ cuerpo, usuarioRegistro }) =>
     fechaActividad: fechaRequerida(cuerpo["fechaActividad"], "fechaActividad"),
     idTipoActividad: enteroOpcional(cuerpo["idTipoActividad"], "idTipoActividad"),
     descripcionActividad: textoOpcional(cuerpo["descripcionActividad"], "descripcionActividad", 300),
+    tituloActividad: textoOpcional(cuerpo["tituloActividad"], "tituloActividad", 150),
+    horaActividad: horaOpcional(cuerpo["horaActividad"], "horaActividad"),
+    lugarActividad: textoOpcional(cuerpo["lugarActividad"], "lugarActividad", 150),
+    horasAbonadas: horasOpcionales(cuerpo["horasAbonadas"]),
+    justificacionActividad: textoOpcional(cuerpo["justificacionActividad"], "justificacionActividad", 1000),
+    idPersonaReporta: enteroOpcional(cuerpo["idPersonaReporta"], "idPersonaReporta"),
+    adjuntos: listaDeObjetos(cuerpo["adjuntos"], "adjuntos", (fila, etiqueta) => ({
+      nombreArchivo: textoRequerido(fila["nombreArchivo"], `${etiqueta}.nombreArchivo`, 200),
+      urlArchivo: textoRequerido(fila["urlArchivo"], `${etiqueta}.urlArchivo`, 300),
+    })),
   }, usuarioRegistro)),
 );
+
+/** Horas que se abonan: de 0 a 999.9, con un decimal como mucho (DECIMAL(4,1)). */
+function horasOpcionales(valor: unknown): number | null {
+  if (valor === undefined || valor === null || valor === "") return null;
+  const numero = typeof valor === "string" ? Number(valor) : valor;
+  if (typeof numero !== "number" || !Number.isFinite(numero) || numero < 0 || numero > 999.9) {
+    throw solicitudInvalida("horasAbonadas debe ser un numero entre 0 y 999.9.");
+  }
+  if (Math.round(numero * 10) !== numero * 10) {
+    throw solicitudInvalida("horasAbonadas admite un decimal como mucho.");
+  }
+  return numero;
+}
 
 router.get("/actividades/{id}", async (peticion) => actividades.obtenerActividad(idDeRuta(peticion)));
 
@@ -389,6 +412,8 @@ router.get("/visorias", async ({ consulta }) =>
   visorias.listarVisorias({
     periodo: enteroOpcional(consulta["periodo"], "periodo"),
     campus: enteroOpcional(consulta["campus"], "campus"),
+    grupo: enteroOpcional(consulta["grupo"], "grupo"),
+    estado: estadoOpcional(consulta["estado"], visorias.ESTADOS_VISORIA),
     desde: fechaOpcional(consulta["desde"], "desde"),
     hasta: fechaOpcional(consulta["hasta"], "hasta"),
   }),
@@ -404,8 +429,11 @@ router.post("/visorias", async ({ cuerpo, usuarioRegistro }) =>
     horaVisoria: horaOpcional(cuerpo["horaVisoria"], "horaVisoria"),
     idLugarVisoria: enteroOpcional(cuerpo["idLugarVisoria"], "idLugarVisoria"),
     idAula: enteroOpcional(cuerpo["idAula"], "idAula"),
+    idGrupo: enteroOpcional(cuerpo["idGrupo"], "idGrupo"),
   }, usuarioRegistro)),
 );
+
+router.post("/visorias/{id}/programar", async (peticion) => visorias.programarVisoria(idDeRuta(peticion)));
 
 router.post("/visorias/{id}/citados", async (peticion) => {
   const ids = listaDeIds(peticion.cuerpo["solicitudes"], "solicitudes");

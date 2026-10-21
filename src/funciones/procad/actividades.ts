@@ -26,6 +26,15 @@ const COLUMNAS_ACTIVIDAD = `
   a.idTipoActividad, ta.nombreTipoActividad, a.idSerie, a.descripcionActividad,
   a.idPersonaValidadora, pv.nombrePersona AS nombreValidadora, pv.apellidosPersona AS apellidosValidadora,
   a.observacionValidacion, a.fechaValidacion, a.usuarioRegistro, a.fechaRegistro,
+  a.tituloActividad, CONVERT(VARCHAR(5), a.horaActividad, 108) AS horaActividad, a.lugarActividad,
+  a.horasAbonadas, a.justificacionActividad,
+  a.idPersonaReporta, pr.nombrePersona AS nombreReporta, pr.apellidosPersona AS apellidosReporta,
+  pr.correoPersona AS correoReporta,
+  (SELECT x.idAdjuntoActividad, x.nombreArchivo, x.urlArchivo
+     FROM Procad.tblAdjuntosActividades x
+    WHERE x.idActividad = a.idActividad
+    ORDER BY x.idAdjuntoActividad
+      FOR JSON PATH) AS adjuntos,
   (SELECT COUNT(*) FROM Procad.tblAsistencias x WHERE x.idActividad = a.idActividad) AS inscritos,
   (SELECT COUNT(*) FROM Procad.tblAsistencias x WHERE x.idActividad = a.idActividad AND x.asistio = 1) AS presentes`;
 
@@ -36,7 +45,14 @@ const DESDE_ACTIVIDAD = `
  INNER JOIN Catalogo.tblCampus c    ON c.idCampus = g.idCampus
  INNER JOIN Catalogo.tblEstados e   ON e.idEstado = a.idEstado
   LEFT JOIN Procad.tblTiposActividades ta ON ta.idTipoActividad = a.idTipoActividad
-  LEFT JOIN Catalogo.tblPersonas pv ON pv.idPersona = a.idPersonaValidadora`;
+  LEFT JOIN Catalogo.tblPersonas pv ON pv.idPersona = a.idPersonaValidadora
+  LEFT JOIN Catalogo.tblPersonas pr ON pr.idPersona = a.idPersonaReporta`;
+
+/** Los adjuntos llegan como texto de FOR JSON; se devuelven como lista. */
+function conAdjuntos<T extends Record<string, unknown>>(fila: T) {
+  const adjuntos = fila["adjuntos"];
+  return { ...fila, adjuntos: typeof adjuntos === "string" && adjuntos !== "" ? JSON.parse(adjuntos) : [] };
+}
 
 /* ------------------------------- Actividades ------------------------------ */
 
@@ -50,7 +66,7 @@ export interface FiltrosActividades {
   hasta: string | null;
 }
 
-export function listarActividades(f: FiltrosActividades) {
+export async function listarActividades(f: FiltrosActividades) {
   const filtros = new Filtros()
     .si(f.grupo, "grupo", sql.Int, "a.idGrupo = @grupo")
     .si(f.periodo, "periodo", sql.Int, "a.idPeriodo = @periodo")
@@ -59,12 +75,13 @@ export function listarActividades(f: FiltrosActividades) {
     .si(f.serie, "serie", sql.Int, "a.idSerie = @serie")
     .si(f.desde, "desde", sql.Date, "a.fechaActividad >= @desde")
     .si(f.hasta, "hasta", sql.Date, "a.fechaActividad <= @hasta");
-  return consultar(`
+  const filas = await consultar(`
     SELECT ${COLUMNAS_ACTIVIDAD}
     ${DESDE_ACTIVIDAD}
     ${filtros.where}
      ORDER BY a.fechaActividad DESC, a.idActividad DESC
   `, filtros.parametros);
+  return filas.map(conAdjuntos);
 }
 
 export async function obtenerActividad(idActividad: number) {
@@ -74,7 +91,7 @@ export async function obtenerActividad(idActividad: number) {
      WHERE a.idActividad = @id
   `, { id: [sql.Int, idActividad] });
   if (!fila) throw noEncontrado(`No existe la actividad ${idActividad}.`);
-  return fila;
+  return conAdjuntos(fila);
 }
 
 export interface NuevaActividad {
@@ -83,25 +100,59 @@ export interface NuevaActividad {
   fechaActividad: string;
   idTipoActividad: number | null;
   descripcionActividad: string | null;
+  tituloActividad: string | null;
+  horaActividad: string | null;
+  lugarActividad: string | null;
+  horasAbonadas: number | null;
+  justificacionActividad: string | null;
+  /** El encargado que la reporta. */
+  idPersonaReporta: number | null;
+  /** Enlaces al respaldo; la base guarda el enlace, nunca el archivo. */
+  adjuntos: { nombreArchivo: string; urlArchivo: string }[];
 }
 
 /** Actividad puntual reportada por el encargado (RF-26). Nace PENDIENTE_VALIDACION. */
 export async function crearActividad(n: NuevaActividad, usuario: string) {
-  const filas = await consultar<{ id: number }>(`
-    INSERT INTO Procad.tblActividades
-      (idGrupo, idPeriodo, idEstado, fechaActividad, idTipoActividad, descripcionActividad, usuarioRegistro)
-    VALUES (@grupo, @periodo, ${idEstado(CONTEXTO.actividad, "pendiente")}, @fecha, @tipo, @descripcion, @usuario);
-    SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
-  `, {
-    grupo: [sql.Int, n.idGrupo],
-    periodo: [sql.Int, n.idPeriodo],
-    pendiente: [sql.NVarChar(40), "PENDIENTE_VALIDACION"],
-    fecha: [sql.Date, n.fechaActividad],
-    tipo: [sql.Int, n.idTipoActividad],
-    descripcion: [sql.NVarChar(300), n.descripcionActividad],
-    usuario: usuarioParam(usuario),
+  const id = await enTransaccion(async (ejecutar) => {
+    const filas = await ejecutar<{ id: number }>(`
+      INSERT INTO Procad.tblActividades
+        (idGrupo, idPeriodo, idEstado, fechaActividad, idTipoActividad, descripcionActividad,
+         tituloActividad, horaActividad, lugarActividad, horasAbonadas, justificacionActividad,
+         idPersonaReporta, usuarioRegistro)
+      VALUES (@grupo, @periodo, ${idEstado(CONTEXTO.actividad, "pendiente")}, @fecha, @tipo, @descripcion,
+              @titulo, @hora, @lugar, @horas, @justificacion, @reporta, @usuario);
+      SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
+    `, {
+      grupo: [sql.Int, n.idGrupo],
+      periodo: [sql.Int, n.idPeriodo],
+      pendiente: [sql.NVarChar(40), "PENDIENTE_VALIDACION"],
+      fecha: [sql.Date, n.fechaActividad],
+      tipo: [sql.Int, n.idTipoActividad],
+      descripcion: [sql.NVarChar(300), n.descripcionActividad],
+      titulo: [sql.NVarChar(150), n.tituloActividad],
+      hora: [sql.VarChar(8), n.horaActividad],
+      lugar: [sql.NVarChar(150), n.lugarActividad],
+      horas: [sql.Decimal(4, 1), n.horasAbonadas],
+      justificacion: [sql.NVarChar(1000), n.justificacionActividad],
+      reporta: [sql.Int, n.idPersonaReporta],
+      usuario: usuarioParam(usuario),
+    });
+    const idActividad = filas[0]!.id;
+
+    for (const adjunto of n.adjuntos) {
+      await ejecutar(`
+        INSERT INTO Procad.tblAdjuntosActividades (idActividad, nombreArchivo, urlArchivo, usuarioRegistro)
+        VALUES (@actividad, @nombre, @url, @usuario)
+      `, {
+        actividad: [sql.Int, idActividad],
+        nombre: [sql.NVarChar(200), adjunto.nombreArchivo],
+        url: [sql.NVarChar(300), adjunto.urlArchivo],
+        usuario: usuarioParam(usuario),
+      });
+    }
+    return idActividad;
   });
-  return obtenerActividad(filas[0]!.id);
+  return obtenerActividad(id);
 }
 
 export interface Validacion {

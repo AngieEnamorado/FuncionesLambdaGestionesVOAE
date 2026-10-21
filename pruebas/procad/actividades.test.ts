@@ -247,3 +247,57 @@ describe("POST /periodos/activar", () => {
     assert.equal(codigo, 400);
   });
 });
+
+describe("Detalle de la actividad (columnas del 2026-09-23)", () => {
+  const detallada = {
+    idGrupo: 4, idPeriodo: 3, fechaActividad: "2026-10-01", idTipoActividad: 5,
+    tituloActividad: "Concierto de apertura", horaActividad: "17:30", lugarActividad: "Auditorio Juan Lindo",
+    horasAbonadas: 3.5, justificacionActividad: "Semana cultural", idPersonaReporta: 20,
+    adjuntos: [
+      { nombreArchivo: "lista.pdf", urlArchivo: "actividades/lista.pdf" },
+      { nombreArchivo: "foto.jpg", urlArchivo: "actividades/foto.jpg" },
+    ],
+  };
+
+  test("POST guarda el detalle y cada adjunto, y devuelve los adjuntos como lista", async () => {
+    responderPor([
+      [/INSERT INTO Procad\.tblActividades/, [{ id: 11 }]],
+      [/FROM Procad\.tblActividades a/, [{ ...ACTIVIDAD, adjuntos: '[{"nombreArchivo":"lista.pdf"}]' }]],
+    ]);
+    const { codigo, cuerpo } = await invocar(handler, "POST", "/v1/procad/actividades", detallada);
+
+    assert.equal(codigo, 201);
+    assert.deepEqual(cuerpo.adjuntos, [{ nombreArchivo: "lista.pdf" }]);
+    const insert = llamadaCon(/INSERT INTO Procad\.tblActividades/);
+    assert.equal(insert.parametros["titulo"], "Concierto de apertura");
+    assert.equal(insert.parametros["horas"], 3.5);
+    assert.equal(insert.parametros["reporta"], 20);
+    assert.equal(cuantasCon(/INSERT INTO Procad\.tblAdjuntosActividades/), 2);
+  });
+
+  test("horas con mas de un decimal es 400", async () => {
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/actividades", { ...detallada, horasAbonadas: 2.25 });
+    assert.equal(codigo, 400);
+  });
+
+  test("horas negativas es 400", async () => {
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/actividades", { ...detallada, horasAbonadas: -1 });
+    assert.equal(codigo, 400);
+  });
+
+  test("un adjunto sin enlace es 400", async () => {
+    const { codigo } = await invocar(handler, "POST", "/v1/procad/actividades", {
+      ...detallada, adjuntos: [{ nombreArchivo: "lista.pdf" }],
+    });
+    assert.equal(codigo, 400);
+    assert.equal(llamadas.length, 0);
+  });
+
+  test("GET /actividades trae al encargado y los adjuntos", async () => {
+    responderPor([[/FROM Procad\.tblActividades a/, [{ idActividad: 1, nombreReporta: "Diego", adjuntos: null }]]]);
+    const { cuerpo } = await invocar(handler, "GET", "/v1/procad/actividades");
+    assert.equal(cuerpo[0].nombreReporta, "Diego");
+    assert.deepEqual(cuerpo[0].adjuntos, []);
+    assert.match(llamadaCon(/FROM Procad\.tblActividades a/).texto, /LEFT JOIN Catalogo\.tblPersonas pr/);
+  });
+});

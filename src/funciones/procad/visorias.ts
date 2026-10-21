@@ -5,28 +5,43 @@
  * - tgrVisoriasNoTraslape: no dos visorias en el mismo lugar, fecha y hora (RF-51).
  * - tgrVisoriasLugarMismoCampus: el lugar es del mismo campus que la visoria.
  *
- * El esquema no tiene estado de visoria (BORRADOR/PROGRAMADA) ni cupo: una
- * visoria existe en cuanto se crea, y citar a un estudiante es asignarle la
- * visoria en su solicitud (tblSolicitudes.idVisoriaAsignada).
+ * - tgrVisoriasGrupoMismoCampus: el grupo que cita es del mismo campus (salvo una seleccion).
+ *
+ * Una visoria nace BORRADOR: solo la ve el administrador hasta que la programa.
+ * No tiene cupo; citar a un estudiante es asignarle la visoria en su solicitud
+ * (tblSolicitudes.idVisoriaAsignada).
  */
 import { consultar, consultarUna, enTransaccion, sql, type Parametro } from "../../compartido/db";
-import { noEncontrado } from "../../compartido/errores";
+import { conflicto, noEncontrado } from "../../compartido/errores";
 import { Filtros, usuarioParam } from "./entrada";
 
 const COLUMNAS_VISORIA = `
   v.idVisoria, v.idPeriodo, v.idCampus, c.nombreCampus, v.fechaVisoria,
   CONVERT(VARCHAR(5), v.horaVisoria, 108) AS horaVisoria,
-  v.idLugarVisoria, lv.nombreLugar, v.idAula, au.nombreAula, v.usuarioRegistro, v.fechaRegistro,
+  v.idLugarVisoria, lv.nombreLugar, v.idAula, au.nombreAula, v.idGrupo, g.nombreGrupo, v.estadoVisoria,
+  v.usuarioRegistro, v.fechaRegistro,
   (SELECT COUNT(*) FROM Procad.tblSolicitudes s WHERE s.idVisoriaAsignada = v.idVisoria) AS citados`;
 
 const DESDE_VISORIA = `
   FROM Procad.tblVisorias v
  INNER JOIN Catalogo.tblCampus c ON c.idCampus = v.idCampus
   LEFT JOIN Procad.tblLugaresVisoria lv ON lv.idLugarVisoria = v.idLugarVisoria
-  LEFT JOIN Procad.tblAulas au ON au.idAula = v.idAula`;
+  LEFT JOIN Procad.tblAulas au ON au.idAula = v.idAula
+  LEFT JOIN Procad.tblGrupos g ON g.idGrupo = v.idGrupo`;
 
-export function listarVisorias(f: { periodo: number | null; campus: number | null; desde: string | null; hasta: string | null }) {
+export const ESTADOS_VISORIA = ["BORRADOR", "PROGRAMADA"] as const;
+
+export function listarVisorias(f: {
+  periodo: number | null;
+  campus: number | null;
+  grupo: number | null;
+  estado: string | null;
+  desde: string | null;
+  hasta: string | null;
+}) {
   const filtros = new Filtros()
+    .si(f.grupo, "grupo", sql.Int, "v.idGrupo = @grupo")
+    .si(f.estado, "estado", sql.NVarChar(15), "v.estadoVisoria = @estado")
     .si(f.periodo, "periodo", sql.Int, "v.idPeriodo = @periodo")
     .si(f.campus, "campus", sql.Int, "v.idCampus = @campus")
     .si(f.desde, "desde", sql.Date, "v.fechaVisoria >= @desde")
@@ -69,13 +84,14 @@ export interface NuevaVisoria {
   horaVisoria: string | null;
   idLugarVisoria: number | null;
   idAula: number | null;
+  idGrupo: number | null;
 }
 
 export async function crearVisoria(n: NuevaVisoria, usuario: string) {
   const filas = await consultar<{ id: number }>(`
     INSERT INTO Procad.tblVisorias
-      (idPeriodo, idCampus, fechaVisoria, horaVisoria, idLugarVisoria, idAula, usuarioRegistro)
-    VALUES (@periodo, @campus, @fecha, @hora, @lugar, @aula, @usuario);
+      (idPeriodo, idCampus, fechaVisoria, horaVisoria, idLugarVisoria, idAula, idGrupo, estadoVisoria, usuarioRegistro)
+    VALUES (@periodo, @campus, @fecha, @hora, @lugar, @aula, @grupo, N'BORRADOR', @usuario);
     SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
   `, {
     periodo: [sql.Int, n.idPeriodo],
@@ -84,9 +100,29 @@ export async function crearVisoria(n: NuevaVisoria, usuario: string) {
     hora: [sql.VarChar(8), n.horaVisoria],
     lugar: [sql.Int, n.idLugarVisoria],
     aula: [sql.Int, n.idAula],
+    grupo: [sql.Int, n.idGrupo],
     usuario: usuarioParam(usuario),
   });
   return obtenerVisoria(filas[0]!.id);
+}
+
+/** De BORRADOR a PROGRAMADA: desde ahi la visoria es visible para los citados. */
+export async function programarVisoria(idVisoria: number) {
+  await enTransaccion(async (ejecutar) => {
+    const actual = await ejecutar<{ estadoVisoria: string }>(
+      "SELECT estadoVisoria FROM Procad.tblVisorias WITH (UPDLOCK) WHERE idVisoria = @id",
+      { id: [sql.Int, idVisoria] },
+    );
+    if (!actual[0]) throw noEncontrado(`No existe la visoria ${idVisoria}.`);
+    if (actual[0].estadoVisoria !== "BORRADOR") {
+      throw conflicto(`La visoria ${idVisoria} ya esta programada.`);
+    }
+    await ejecutar(
+      "UPDATE Procad.tblVisorias SET estadoVisoria = N'PROGRAMADA' WHERE idVisoria = @id",
+      { id: [sql.Int, idVisoria] },
+    );
+  });
+  return obtenerVisoria(idVisoria);
 }
 
 /**
