@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { beforeEach, test } from "node:test";
+import { beforeEach, describe, test } from "node:test";
 import { invalidarCache } from "../../src/compartido/catalogos";
 import { handler } from "../../src/funciones/procad/index";
 import { alConsultar, llamadas } from "../dobles/db";
 import { invocar } from "../evento";
+import { cuantasCon, llamadaCon, responderPor } from "./ayuda";
 
 const CATALOGOS = [
   "tiposGrupo", "deportes", "posiciones", "disciplinas", "instrumentos",
@@ -89,4 +90,30 @@ test("un fallo al cargar no queda cacheado", async () => {
 test("POST /catalogos es 405: es de solo lectura", async () => {
   const { codigo } = await invocar(handler, "POST", "/v1/procad/catalogos", {});
   assert.equal(codigo, 405);
+});
+
+describe("Usuarios del panel", () => {
+  test("GET lista a las personas con roles de PROCAD, sin INTEGRANTE", async () => {
+    const { codigo } = await invocar(handler, "GET", "/v1/procad/usuarios");
+    assert.equal(codigo, 200);
+    const { texto } = llamadaCon(/FROM Catalogo\.tblPersonaPerfilRol ppr/);
+    assert.match(texto, /r\.nombreRol <> N'INTEGRANTE'/);
+  });
+
+  test("PUT desactiva sus roles de PROCAD", async () => {
+    responderPor([[/FROM Catalogo\.tblPersonaPerfilRol ppr\s+INNER JOIN Catalogo\.tblRoles r\s+ON r\.idRol = ppr\.idRol\s+INNER JOIN/, [
+      { idPersona: 9, nombrePersona: "Ana", activo: true },
+    ]]]);
+    const { codigo } = await invocar(handler, "PUT", "/v1/procad/usuarios/9", { activo: false });
+    assert.equal(codigo, 200);
+    const update = llamadaCon(/UPDATE ppr/);
+    assert.deepEqual(update.parametros, { persona: 9, activo: false });
+  });
+
+  test("PUT de alguien sin roles de PROCAD es 404 y no actualiza", async () => {
+    responderPor([]);
+    const { codigo } = await invocar(handler, "PUT", "/v1/procad/usuarios/9", { activo: false });
+    assert.equal(codigo, 404);
+    assert.equal(cuantasCon(/UPDATE ppr/), 0);
+  });
 });

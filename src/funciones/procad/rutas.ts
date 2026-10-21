@@ -43,6 +43,7 @@ import {
 import * as grupos from "./grupos";
 import * as listas from "./listas";
 import * as solicitudes from "./solicitudes";
+import * as usuarios from "./usuarios";
 import * as visorias from "./visorias";
 
 export const router = crearRouter("/v1/procad");
@@ -483,6 +484,16 @@ router.put("/accesos/personas/{id}", async (peticion) => {
   const activo = booleanoOpcional(peticion.cuerpo["activo"], "activo");
   if (activo === null) throw solicitudInvalida("El campo activo es obligatorio: true o false.");
   return grupos.cambiarAccesoPersona(idDeRuta(peticion), activo);
+});
+
+/* -------------------------------- Usuarios ------------------------------- */
+
+router.get("/usuarios", async () => usuarios.listarUsuarios());
+
+router.put("/usuarios/{id}", async (peticion) => {
+  const activo = booleanoOpcional(peticion.cuerpo["activo"], "activo");
+  if (activo === null) throw solicitudInvalida("El campo activo es obligatorio: true o false.");
+  return usuarios.cambiarEstadoUsuario(idDeRuta(peticion), activo);
 });
 
 /* -------------------------------- Salud --------------------------------- */

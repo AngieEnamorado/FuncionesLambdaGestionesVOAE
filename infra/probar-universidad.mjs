@@ -8,7 +8,8 @@
  * 2. Apunta el frontend al backend local con FrontEnd-Gestiones-VOAE/.env.development.local,
  *    que Vite lee por encima de .env.local: no se toca la configuracion de nadie,
  *    y borrando ese archivo el frontend vuelve a usar AWS.
- * 3. Arranca el backend (infra/servidor-local.mjs procad --escritura).
+ * 3. Arranca el backend: procad (con escritura) y catalogo (periodos y campus
+ *    de la misma base; el de AWS lee Azure).
  * 4. Comprueba que lee de la base y de Registro, y dice que fallo si algo falla.
  * 5. Arranca el frontend (npm run dev).
  *
@@ -22,7 +23,9 @@ import { fileURLToPath } from "node:url";
 
 const raiz = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PUERTO = 3000;
+const PUERTO_CATALOGO = 3001;
 const API = `http://localhost:${PUERTO}/v1/procad`;
+const API_CATALOGO = `http://localhost:${PUERTO_CATALOGO}/v1/catalogo`;
 const esWindows = process.platform === "win32";
 
 const ok = (texto) => console.log(`  ✔ ${texto}`);
@@ -101,6 +104,7 @@ async function configurarFrontend() {
     "# Manda PROCAD al backend de esta PC (y de ahi a la base de la universidad).",
     "# Borre este archivo para volver a usar las Lambdas de AWS.",
     `VITE_API_PROCAD_URL=${API}`,
+    `VITE_API_CATALOGO_URL=${API_CATALOGO}`,
     "",
   ].join("\n"));
   ok(`PROCAD usara ${API}`);
@@ -119,10 +123,8 @@ function instalarSiFalta(carpeta, nombre) {
   }
 }
 
-function arrancarBackend() {
-  paso("3. Arrancando el backend de PROCAD");
-  instalarSiFalta(raiz, "el backend");
-  const proceso = spawn(process.execPath, [join(raiz, "infra", "servidor-local.mjs"), "procad", "--escritura"], {
+function arrancarFuncion(funcion, argumentos) {
+  const proceso = spawn(process.execPath, [join(raiz, "infra", "servidor-local.mjs"), funcion, ...argumentos], {
     cwd: raiz,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -131,7 +133,7 @@ function arrancarBackend() {
     let listo = false;
     const mostrar = (trozo) => {
       for (const linea of trozo.toString().split(/\r?\n/)) {
-        if (linea.trim()) console.log(`  [backend] ${linea}`);
+        if (linea.trim()) console.log(`  [${funcion}] ${linea}`);
         if (linea.includes("escuchando en") && !listo) {
           listo = true;
           resolver(proceso);
@@ -142,7 +144,7 @@ function arrancarBackend() {
     proceso.stderr.on("data", mostrar);
     proceso.on("exit", (codigo) => {
       if (!listo) {
-        mal(`El backend no arranco (codigo ${codigo}). Revise el mensaje de arriba.`);
+        mal(`${funcion} no arranco (codigo ${codigo}). Revise el mensaje de arriba.`);
         process.exit(1);
       }
     });
@@ -185,7 +187,11 @@ async function comprobar(ruta, descripcion) {
 
 await configurarBackend();
 const carpetaFrontend = await configurarFrontend();
-const backend = await arrancarBackend();
+paso("3. Arrancando el backend (procad y catalogo)");
+instalarSiFalta(raiz, "el backend");
+const procad = await arrancarFuncion("procad", ["--escritura"]);
+const catalogo = await arrancarFuncion("catalogo", ["--puerto", String(PUERTO_CATALOGO)]);
+const backend = { kill: () => { procad.kill(); catalogo.kill(); } };
 
 paso("4. Comprobando la base");
 const leeBase = await comprobar("/grupos", "Lee de la base (GET /grupos)");
