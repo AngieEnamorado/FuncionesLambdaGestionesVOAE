@@ -20,10 +20,13 @@ const carpetaPruebas = join(raiz, "pruebas");
 const destino = join(raiz, "dist", "pruebas");
 const dobleDb = join(carpetaPruebas, "dobles", "db.ts");
 const filtro = process.argv[2] ?? "";
+// Voluntariado trae sus propios dobles y se corre con pruebas/voluntariado/correr.mjs.
+const conCorredorPropio = join("pruebas", "voluntariado");
 
 const pruebas = readdirSync(carpetaPruebas, { recursive: true })
   .map(String)
   .filter((archivo) => archivo.endsWith(".test.ts") && archivo.includes(filtro))
+  .filter((archivo) => !join("pruebas", archivo).startsWith(conCorredorPropio))
   .map((archivo) => join(carpetaPruebas, archivo));
 
 if (pruebas.length === 0) {
