@@ -28,7 +28,35 @@ let secretoCacheado: SecretoBaseDatos | null = null;
 /** Si dos invocaciones concurrentes lo piden, comparten la misma llamada. */
 let lecturaEnCurso: Promise<SecretoBaseDatos> | null = null;
 
+/**
+ * Solo para infra/servidor-local.mjs: con VOAE_DB_SERVER (y sus hermanas) en
+ * .env.local, la conexion sale de ahi y no de Secrets Manager. Sirve para
+ * probar contra una base que la Lambda todavia no alcanza, sin tocar el
+ * secreto que usan las funciones desplegadas. En AWS no se define.
+ */
+function secretoLocal(): SecretoBaseDatos | null {
+  const env = process.env;
+  if (!env["VOAE_DB_SERVER"]) return null;
+  return {
+    DB_SERVER: env["VOAE_DB_SERVER"],
+    DB_NAME: env["VOAE_DB_NAME"] ?? "",
+    DB_USER: env["VOAE_DB_USER"] ?? "",
+    DB_PASSWORD: env["VOAE_DB_PASSWORD"] ?? "",
+    DB_PORT: env["VOAE_DB_PORT"],
+    DB_TRUST_SERVER_CERTIFICATE: env["VOAE_DB_TRUST_SERVER_CERTIFICATE"],
+    DB_REQUEST_TIMEOUT_MS: env["VOAE_DB_REQUEST_TIMEOUT_MS"],
+  };
+}
+
 async function leerSecreto(): Promise<SecretoBaseDatos> {
+  const local = secretoLocal();
+  if (local) {
+    for (const clave of ["DB_NAME", "DB_USER", "DB_PASSWORD"] as const) {
+      if (!local[clave]) throw new Error(`Falta VOAE_${clave} en .env.local.`);
+    }
+    return local;
+  }
+
   const respuesta = await cliente.send(
     new GetSecretValueCommand({ SecretId: ID_SECRETO }),
   );

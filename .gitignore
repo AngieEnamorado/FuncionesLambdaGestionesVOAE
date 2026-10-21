@@ -7,3 +7,6 @@ Archivos PROMPT/
 
 # Windows
 desktop.ini
+
+# Conexion local a la base (ver .env.local.ejemplo)
+.env.local

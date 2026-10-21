@@ -41,6 +41,16 @@ if (!FUNCIONES.includes(funcion)) {
   process.exit(1);
 }
 
+// Con VOAE_DB_SERVER en .env.local (ver .env.local.ejemplo) la funcion se
+// conecta a esa base y no lee secreto-voae: asi se prueba contra el servidor
+// de la universidad desde una PC de su red, sin tocar AWS.
+try {
+  process.loadEnvFile(join(raiz, ".env.local"));
+} catch {
+  // Sin .env.local: se usa secreto-voae, como la Lambda.
+}
+const baseLocal = process.env.VOAE_DB_SERVER;
+
 // La Lambda corre en us-east-1 y lee el secreto de ahi.
 process.env.AWS_REGION ??= "us-east-1";
 if (process.env.PERFIL_AWS) process.env.AWS_PROFILE ??= process.env.PERFIL_AWS;
@@ -124,7 +134,10 @@ const servidor = createServer(async (peticion, respuesta) => {
 servidor.listen(puerto, "127.0.0.1", () => {
   console.log(`\nvoae-${funcion} escuchando en http://localhost:${puerto}/v1/${funcion}`);
   console.log(`  Prueba:  http://localhost:${puerto}/v1/${funcion}/salud`);
-  console.log(`  Base:    Azure (compartida). Modo: ${escritura ? "LECTURA Y ESCRITURA" : "solo lectura (use --escritura para POST/PUT)"}`);
-  console.log("  La primera peticion tarda mas: conecta con Azure y, si la base estaba pausada, la despierta.");
+  const base = baseLocal
+    ? `${baseLocal}/${process.env.VOAE_DB_NAME} (de .env.local)`
+    : "Azure, la de secreto-voae (compartida)";
+  console.log(`  Base:    ${base}. Modo: ${escritura ? "LECTURA Y ESCRITURA" : "solo lectura (use --escritura para POST/PUT)"}`);
+  console.log("  La primera peticion tarda mas: abre la conexion con la base.");
   console.log("  Ctrl+C para detener.\n");
 });
