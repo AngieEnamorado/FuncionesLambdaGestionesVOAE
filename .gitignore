@@ -1,3 +1,9 @@
 node_modules/
 dist/
 *.zip
+
+# Material de apoyo para prompts (scripts de la base, codigo empaquetado)
+Archivos PROMPT/
+
+# Windows
+desktop.ini
