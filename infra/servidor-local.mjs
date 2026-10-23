@@ -134,9 +134,12 @@ const servidor = createServer(async (peticion, respuesta) => {
 servidor.listen(puerto, "127.0.0.1", () => {
   console.log(`\nvoae-${funcion} escuchando en http://localhost:${puerto}/v1/${funcion}`);
   console.log(`  Prueba:  http://localhost:${puerto}/v1/${funcion}/salud`);
+  const idSecreto = process.env.ID_SECRETO_VOAE;
   const base = baseLocal
     ? `${baseLocal}/${process.env.VOAE_DB_NAME} (de .env.local)`
-    : "Azure, la de secreto-voae (compartida)";
+    : idSecreto
+      ? `la de ${idSecreto} (Secrets Manager)`
+      : "Azure, la de secreto-voae (compartida)";
   console.log(`  Base:    ${base}. Modo: ${escritura ? "LECTURA Y ESCRITURA" : "solo lectura (use --escritura para POST/PUT)"}`);
   console.log("  La primera peticion tarda mas: abre la conexion con la base.");
   console.log("  Ctrl+C para detener.\n");

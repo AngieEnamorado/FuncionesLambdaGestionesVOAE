@@ -54,6 +54,12 @@ async function configurarBackend() {
   paso("1. Conexion a la base de la universidad");
   const archivo = join(raiz, ".env.local");
 
+  const idSecreto = existsSync(archivo) && readFileSync(archivo, "utf8").match(/^ID_SECRETO_VOAE=(\S+)/m)?.[1];
+  if (idSecreto) {
+    ok(`Se usan las credenciales de ${idSecreto} (Secrets Manager, credenciales de AWS de esta PC)`);
+    return;
+  }
+
   if (existsSync(archivo) && /^VOAE_DB_SERVER=\S+/m.test(readFileSync(archivo, "utf8"))) {
     const servidor = readFileSync(archivo, "utf8").match(/^VOAE_DB_SERVER=(\S+)/m)[1];
     const usar = await preguntar(`Ya hay datos guardados (servidor ${servidor}). Usarlos? (s/n)`, { porDefecto: "s" });

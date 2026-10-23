@@ -65,7 +65,11 @@ async function leerSecreto(): Promise<SecretoBaseDatos> {
     throw new Error(`El secreto ${ID_SECRETO} no tiene contenido de texto.`);
   }
 
-  const secreto = JSON.parse(respuesta.SecretString) as SecretoBaseDatos;
+  const secreto = JSON.parse(respuesta.SecretString) as SecretoBaseDatos & {
+    DB_CONFIAR_CERTIFICADO?: string | boolean;
+  };
+  // secreto-voae-local (lo creo la DEGT) nombra asi la opcion del certificado.
+  secreto.DB_TRUST_SERVER_CERTIFICATE ??= secreto.DB_CONFIAR_CERTIFICADO;
 
   for (const clave of ["DB_SERVER", "DB_NAME", "DB_USER", "DB_PASSWORD"] as const) {
     if (!secreto[clave]) {
