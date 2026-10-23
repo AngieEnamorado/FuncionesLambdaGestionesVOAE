@@ -33,7 +33,12 @@ export async function conectar(): Promise<void> {
     user: s.DB_USER,
     password: s.DB_PASSWORD,
     port: s.DB_PORT ? Number(s.DB_PORT) : 1433,
-    options: { encrypt: true, trustServerCertificate: false, useUTC: true },
+    options: {
+      encrypt: true,
+      // El SQL Server de la universidad tiene certificado propio (autofirmado).
+      trustServerCertificate: String(s.DB_TRUST_SERVER_CERTIFICATE).toLowerCase() === "true",
+      useUTC: true,
+    },
     // La base serverless puede estar pausada: aqui si conviene esperar a que despierte.
     connectionTimeout: 90_000,
     requestTimeout: 60_000,
