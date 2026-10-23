@@ -22,7 +22,8 @@ export interface EstudianteRegistro {
   correoInstitucional: string | null;
   telefonoMovil: string | null;
   telefonoFijo: string | null;
-  idGenero: number | null;
+  /** CHAR en Registro: llega como "1" / "2", no como numero. */
+  idGenero: string | number | null;
   genero: string | null;
   idCampus: number | null;
   centro: string | null;
@@ -48,16 +49,19 @@ export async function estudiantesDeRegistro(cuentas: (string | null | undefined)
 }
 
 /** Datos academicos para la ficha y el panel de solicitudes. Conserva los nombres de columna de la v1. */
-export const academicos = (r: EstudianteRegistro) => ({
-  idGenero: r.idGenero,
-  genero: r.genero,
-  sexoPersona: r.idGenero === 1 ? "M" : r.idGenero === 2 ? "F" : null,
-  carreraEstudiante: r.carrera,
-  indicePeriodo: r.indicePeriodo,
-  indiceGlobal: r.indiceGlobal,
-  matriculaVerificada: r.matriculado,
-  forma003: r.forma003,
-});
+export const academicos = (r: EstudianteRegistro) => {
+  const idGenero = r.idGenero === null ? null : Number(r.idGenero);
+  return {
+    idGenero,
+    genero: r.genero,
+    sexoPersona: idGenero === 1 ? "M" : idGenero === 2 ? "F" : null,
+    carreraEstudiante: r.carrera,
+    indicePeriodo: r.indicePeriodo,
+    indiceGlobal: r.indiceGlobal,
+    matriculaVerificada: r.matriculado,
+    forma003: r.forma003,
+  };
+};
 
 /**
  * Llena nombre, apellidos, correo y telefono de cada fila que trae

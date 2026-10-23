@@ -7,7 +7,7 @@
  * (camelCase) en vez de renombrarse: el frontend tambien es camelCase y una
  * traduccion de nombres es una capa mas donde desincronizarse.
  */
-import { consultar, consultarUna, sql, type Parametro } from "../../compartido/db";
+import { consultar, consultarUna, ejecutarProcedimiento, sql, type Parametro } from "../../compartido/db";
 import { enCache } from "../../compartido/catalogos";
 
 /* --------------------------- Tablas de referencia -------------------------
@@ -104,32 +104,90 @@ export const listarPerfiles = () =>
     `),
   );
 
-export const listarProgramas = () =>
-  enCache("programas", () =>
-    consultar(`
-      SELECT idPrograma, nombrePrograma, siglasPrograma, descripcionPrograma,
-             estadoPrograma
-        FROM Catalogo.tblProgramasVoae
-       WHERE estadoPrograma = 1
-       ORDER BY idPrograma
-    `),
-  );
-
 /* ------------------------------- Identidad -------------------------------
    No hay tablas "Empleado" ni "Estudiante": hay una sola tblPersonas, y ser
    empleado o estudiante es un rol que la persona tiene (tblPersonaPerfilRol),
    con sus atributos en tablas de detalle 1:1. Los endpoints respetan eso: se
-   pide la persona, y aparte su detalle.                                    */
+   pide la persona, y aparte su detalle.
 
-export const obtenerPersona = (idPersona: number) =>
-  consultarUna(`
+   DbVoae v2: de un estudiante la base solo guarda numeroCuenta; nombre,
+   correo, genero, campus e indices se leen en vivo de Registro (linked
+   server). Sexo pasa a idGenero; sexoPersona se sigue entregando, derivado,
+   para no romper a quien ya lo lee.                                       */
+
+/** Lo que devuelve Registro.spObtenerEstudiantes (Catalogo.vwEstudiantesRegistro). */
+interface EstudianteRegistro {
+  numeroCuenta: string;
+  primerNombre: string | null;
+  segundoNombre: string | null;
+  primerApellido: string | null;
+  segundoApellido: string | null;
+  correoInstitucional: string | null;
+  telefonoMovil: string | null;
+  telefonoFijo: string | null;
+  /** CHAR en Registro: llega como "1" / "2", no como numero. */
+  idGenero: string | number | null;
+  genero: string | null;
+  idCampus: number | null;
+  centro: string | null;
+  carrera: string | null;
+  indicePeriodo: number | null;
+  indiceGlobal: number | null;
+  forma003: string | null;
+  matriculado: boolean;
+}
+
+const unir = (...partes: (string | null)[]) =>
+  partes.filter((p) => p !== null && p.trim() !== "").join(" ") || null;
+
+const sexoDeGenero = (idGenero: unknown) => {
+  const id = idGenero === null || idGenero === undefined ? null : Number(idGenero);
+  return id === 1 ? "M" : id === 2 ? "F" : null;
+};
+
+/** Sin transaccion ni JOIN con tablas locales: asi lo piden los objetos de Registro. */
+async function estudianteDeRegistro(numeroCuenta: string): Promise<EstudianteRegistro | null> {
+  const [fila] = await ejecutarProcedimiento<EstudianteRegistro>("Registro.spObtenerEstudiantes", {
+    cuentas: [sql.NVarChar(sql.MAX), numeroCuenta],
+  });
+  return fila ?? null;
+}
+
+/** Los datos personales de Registro, con los nombres de columna de tblPersonas. */
+const personaDeRegistro = (r: EstudianteRegistro) => ({
+  nombrePersona: unir(r.primerNombre, r.segundoNombre),
+  apellidosPersona: unir(r.primerApellido, r.segundoApellido),
+  correoPersona: r.correoInstitucional,
+  telefonoPersona: r.telefonoMovil ?? r.telefonoFijo,
+  idGenero: r.idGenero === null ? null : Number(r.idGenero),
+  genero: r.genero,
+  sexoPersona: sexoDeGenero(r.idGenero),
+  idCampus: r.idCampus,
+  nombreCampus: r.centro,
+});
+
+export async function obtenerPersona(idPersona: number) {
+  const persona = await consultarUna(`
     SELECT p.idPersona, p.nombrePersona, p.apellidosPersona, p.correoPersona,
-           p.sexoPersona, p.telefonoPersona, p.idCampus, c.nombreCampus,
-           p.estadoPersona, p.fechaRegistro
+           p.idGenero, g.nombreGenero AS genero, p.telefonoPersona,
+           p.idCampus, c.nombreCampus, p.estadoPersona, p.fechaRegistro,
+           de.numeroCuenta
       FROM Catalogo.tblPersonas p
+      LEFT JOIN Catalogo.tblGeneros g ON g.idGenero = p.idGenero
       LEFT JOIN Catalogo.tblCampus c ON c.idCampus = p.idCampus
+      LEFT JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = p.idPersona
      WHERE p.idPersona = @idPersona
   `, { idPersona: [sql.Int, idPersona] });
+  if (!persona) return null;
+
+  // Estudiante: Registro manda. Si Registro no lo tiene, quedan los datos locales.
+  const registro = typeof persona["numeroCuenta"] === "string"
+    ? await estudianteDeRegistro(persona["numeroCuenta"])
+    : null;
+  return registro
+    ? { ...persona, ...personaDeRegistro(registro) }
+    : { ...persona, sexoPersona: sexoDeGenero(persona["idGenero"]) };
+}
 
 /**
  * Que es esa persona y en que programa. Es el endpoint que reemplazara al
@@ -149,30 +207,44 @@ export const listarPerfilesDePersona = (idPersona: number) =>
      ORDER BY r.sistemaRol, r.nombreRol
   `, { idPersona: [sql.Int, idPersona] });
 
-export const obtenerEstudiante = (numeroCuenta: string) =>
-  consultarUna(`
-    SELECT de.idPersona, de.numeroCuenta, de.carreraEstudiante,
-           de.indicePeriodo, de.indiceGlobal, de.forma003Url, de.fotoUrl,
-           de.carnetDigitalUrl, de.matriculaVerificada,
-           de.fechaMatriculaVerificada,
-           p.nombrePersona, p.apellidosPersona, p.correoPersona,
-           p.telefonoPersona, p.sexoPersona, p.idCampus, c.nombreCampus
-      FROM Catalogo.tblDetallesEstudiantes de
-      INNER JOIN Catalogo.tblPersonas p ON p.idPersona = de.idPersona
-      LEFT JOIN Catalogo.tblCampus c ON c.idCampus = p.idCampus
-     WHERE de.numeroCuenta = @numeroCuenta
-  `, { numeroCuenta: [sql.NVarChar(15), numeroCuenta] });
+/**
+ * El estudiante tal como lo tiene Registro. idPersona es NULL si todavia no
+ * hizo ningun tramite en VOAE (la base local aun no lo conoce). La foto y el
+ * carnet ya no son columnas: los sirve Catalogo.spObtenerFotoEstudiante.
+ */
+export async function obtenerEstudiante(numeroCuenta: string) {
+  const registro = await estudianteDeRegistro(numeroCuenta);
+  if (!registro) return null;
+  const local = await consultarUna<{ idPersona: number }>(
+    "SELECT idPersona FROM Catalogo.tblDetallesEstudiantes WHERE numeroCuenta = @numeroCuenta",
+    { numeroCuenta: [sql.NVarChar(15), numeroCuenta] },
+  );
+  return {
+    idPersona: local?.idPersona ?? null,
+    numeroCuenta: registro.numeroCuenta,
+    carreraEstudiante: registro.carrera,
+    indicePeriodo: registro.indicePeriodo,
+    indiceGlobal: registro.indiceGlobal,
+    forma003: registro.forma003,
+    matriculaVerificada: registro.matriculado,
+    ...personaDeRegistro(registro),
+  };
+}
 
-export const obtenerEmpleado = (numeroEmpleado: string) =>
-  consultarUna(`
+export async function obtenerEmpleado(numeroEmpleado: string) {
+  const empleado = await consultarUna(`
     SELECT dm.idPersona, dm.numeroEmpleado, dm.contratadoVoae,
            p.nombrePersona, p.apellidosPersona, p.correoPersona,
-           p.telefonoPersona, p.sexoPersona, p.idCampus, c.nombreCampus
+           p.telefonoPersona, p.idGenero, g.nombreGenero AS genero,
+           p.idCampus, c.nombreCampus
       FROM Catalogo.tblDetallesEmpleados dm
       INNER JOIN Catalogo.tblPersonas p ON p.idPersona = dm.idPersona
+      LEFT JOIN Catalogo.tblGeneros g ON g.idGenero = p.idGenero
       LEFT JOIN Catalogo.tblCampus c ON c.idCampus = p.idCampus
      WHERE dm.numeroEmpleado = @numeroEmpleado
   `, { numeroEmpleado: [sql.NVarChar(20), numeroEmpleado] });
+  return empleado && { ...empleado, sexoPersona: sexoDeGenero(empleado["idGenero"]) };
+}
 
 /* ----------------------------- Notificaciones ---------------------------- */
 

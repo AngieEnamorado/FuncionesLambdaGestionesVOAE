@@ -146,10 +146,9 @@ función de la que dependen las otras tres, y la dueña del caché de catálogos
 | `GET /v1/catalogo/periodos` | Períodos académicos. |
 | `GET /v1/catalogo/periodos/activo` | El período vigente, que casi toda pantalla necesita por defecto. **Ojo:** no hay columna ni trigger que marque cuál es el activo. Se resuelve por rango de fechas (el período activo cuyo rango contiene hoy) con respaldo al más reciente por año y PAC. Es una convención que la implementación tuvo que inventar; conviene que el equipo la valide o que el esquema la haga explícita. |
 | `GET /v1/catalogo/roles` · `GET /v1/catalogo/perfiles` | Catálogo de roles (14) y perfiles (5). |
-| `GET /v1/catalogo/programas` | Los 3 programas VOAE. |
-| `GET /v1/catalogo/personas/{idPersona}` | Datos de una persona desde `tblPersonas`. |
+| `GET /v1/catalogo/personas/{idPersona}` | Datos de una persona desde `tblPersonas`; si es estudiante, nombre, correo, género y campus salen de Registro (DbVoae v2). |
 | `GET /v1/catalogo/personas/{idPersona}/perfiles` | Sus filas de `tblPersonaPerfilRol` — qué es esa persona y en qué programa. Es el endpoint que reemplazará al mock de sesión del frontend cuando exista auth. |
-| `GET /v1/catalogo/estudiantes/{numeroCuenta}` | Detalle 1:1 desde `tblDetallesEstudiantes` (índices, documentos). |
+| `GET /v1/catalogo/estudiantes/{numeroCuenta}` | El estudiante según Registro (índices, carrera, matrícula), con su `idPersona` local o `null` si VOAE aún no lo conoce. |
 | `GET /v1/catalogo/empleados/{numeroEmpleado}` | Detalle 1:1 desde `tblDetallesEmpleados`. |
 | `GET /v1/catalogo/notificaciones?persona={id}` · `POST .../{id}/lectura` | Bandeja de `tblNotificaciones` y marcado de leída. |
 

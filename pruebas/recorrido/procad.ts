@@ -2,10 +2,16 @@
  * Recorrido de voae-procad contra la base REAL, sin dejar rastro.
  *
  * Llama al handler de verdad (router, validaciones, SQL, triggers, SPs y
- * vistas de Azure) siguiendo el ciclo de PROCAD, con datos inventados que se
+ * vistas de la base) siguiendo el ciclo de PROCAD, con datos inventados que se
  * crean dentro de una transaccion y se revierten al final de cada ronda (ver
  * pruebas/dobles/db-transaccion.ts). Al terminar comprueba que la base quedo
  * como estaba.
+ *
+ * DbVoae v2: los estudiantes no se pueden inventar. Los SPs validan la
+ * matricula en vivo contra Registro (linked server), asi que el recorrido
+ * toma cuentas REALES de Registro que esta base aun no conoce: cinco
+ * matriculadas y una sin matricula. De ellas solo guarda la llave
+ * numeroCuenta (como Catalogo.spAsegurarEstudiante), y no imprime sus datos.
  *
  * La ronda principal recorre el camino feliz. Cada rechazo de trigger va en
  * su propia ronda, porque un trigger que rechaza revierte toda la transaccion.
@@ -80,38 +86,64 @@ interface Base {
   adm: number;
   tiposActividad: number[];
   lugar: number;
+  cuentas: Record<Estudiante, string>;
+}
+
+const ESTUDIANTES = ["juan", "maria", "carla", "pedro", "sofia", "tomas"] as const;
+type Estudiante = (typeof ESTUDIANTES)[number];
+
+let cuentasElegidas: Record<Estudiante, string> | null = null;
+
+/**
+ * Cuentas reales de Ciudad Universitaria (idCampus 1, el de los grupos del
+ * recorrido) que la base local aun no tiene: las cinco primeras matriculadas
+ * y Tomas sin matricula. Se eligen una vez y sirven para todas las rondas.
+ */
+async function elegirCuentas(): Promise<Record<Estudiante, string>> {
+  if (cuentasElegidas) return cuentasElegidas;
+  const elegir = (matriculado: 0 | 1, cuantas: number) => consultar<{ numeroCuenta: string }>(`
+    SELECT TOP (${cuantas}) v.numeroCuenta
+      FROM Catalogo.vwEstudiantesRegistro v
+     WHERE v.idCampus = 1 AND v.matriculado = ${matriculado}
+       AND NOT EXISTS (SELECT 1 FROM Catalogo.tblDetallesEstudiantes d WHERE d.numeroCuenta = v.numeroCuenta)`);
+  const cuentas = [...await elegir(1, 5), ...await elegir(0, 1)].map((f) => f.numeroCuenta);
+  if (cuentas.length < ESTUDIANTES.length) {
+    throw new Error("Registro no devolvio 5 estudiantes matriculados y 1 sin matricula en Ciudad Universitaria.");
+  }
+  cuentasElegidas = Object.fromEntries(ESTUDIANTES.map((n, i) => [n, cuentas[i]!])) as Record<Estudiante, string>;
+  return cuentasElegidas;
 }
 
 /**
  * Personas, perfiles y periodos que la Lambda no crea (son de Catalogo o del
- * portal del estudiante). Todo con correo @ejemplo.invalid y anio 2090, para
+ * portal del estudiante). Todo con usuarioRegistro = MARCA y anio 2090, para
  * que sea inconfundible y se pueda comprobar que no quedo nada.
  */
 async function sembrarBase(): Promise<Base> {
   const u = `N'${MARCA}'`;
-  const fila = await consultarUna<Base & { tiposActividad: string }>(`
+  const cuentas = await elegirCuentas();
+  const fila = await consultarUna<Omit<Base, "cuentas"> & { tiposActividad: string }>(`
     INSERT Catalogo.tblPeriodos (anioPeriodo, numeroPac, fechaInicioPeriodo, fechaFinPeriodo, estadoPeriodo, usuarioRegistro)
     VALUES (2090, 1, '2090-01-10', '2090-04-30', 1, ${u}), (2090, 2, '2090-05-10', '2090-08-30', 1, ${u});
 
-    INSERT Catalogo.tblPersonas (nombrePersona, apellidosPersona, correoPersona, sexoPersona, idCampus, usuarioRegistro) VALUES
-     (N'Juan',  N'Recorrido', N'juan.recorrido@ejemplo.invalid',  N'M', 1, ${u}),
-     (N'Maria', N'Recorrido', N'maria.recorrido@ejemplo.invalid', N'F', 1, ${u}),
-     (N'Carla', N'Recorrido', N'carla.recorrido@ejemplo.invalid', N'F', 1, ${u}),
-     (N'Pedro', N'Recorrido', N'pedro.recorrido@ejemplo.invalid', N'M', 1, ${u}),
-     (N'Sofia', N'Recorrido', N'sofia.recorrido@ejemplo.invalid', N'F', 1, ${u}),
-     (N'Tomas', N'Recorrido', N'tomas.recorrido@ejemplo.invalid', N'M', 1, ${u}),
-     (N'Diego', N'Director',  N'diego.recorrido@ejemplo.invalid', N'M', 1, ${u}),
-     (N'Ana',   N'Admin',     N'ana.recorrido@ejemplo.invalid',   N'F', 1, ${u});
-
     DECLARE @p TABLE (clave NVARCHAR(10), idPersona INT);
-    INSERT @p SELECT LEFT(correoPersona, CHARINDEX(N'.', correoPersona) - 1), idPersona
-      FROM Catalogo.tblPersonas WHERE correoPersona LIKE N'%.recorrido@ejemplo.invalid';
+    DECLARE @e TABLE (clave NVARCHAR(10), numeroCuenta NVARCHAR(15));
+    INSERT @e VALUES (N'juan', @juan), (N'maria', @maria), (N'carla', @carla),
+                     (N'pedro', @pedro), (N'sofia', @sofia), (N'tomas', @tomas);
 
-    -- Tomas no tiene la matricula verificada.
-    INSERT Catalogo.tblDetallesEstudiantes (idPersona, numeroCuenta, matriculaVerificada, usuarioRegistro)
-    SELECT idPersona, CONCAT(N'2090', RIGHT(CONCAT(N'0000000', idPersona), 7)),
-           CASE WHEN clave = N'tomas' THEN 0 ELSE 1 END, ${u}
-      FROM @p WHERE clave NOT IN (N'diego', N'ana');
+    -- Estudiantes como los deja Catalogo.spAsegurarEstudiante: sin datos
+    -- personales (salen de Registro), solo la cuenta. Tomas no esta matriculado.
+    MERGE Catalogo.tblPersonas AS t USING @e AS e ON 1 = 0
+    WHEN NOT MATCHED THEN INSERT (usuarioRegistro) VALUES (${u})
+    OUTPUT e.clave, inserted.idPersona INTO @p;
+    INSERT Catalogo.tblDetallesEstudiantes (idPersona, numeroCuenta, usuarioRegistro)
+    SELECT p.idPersona, e.numeroCuenta, ${u} FROM @p p INNER JOIN @e e ON e.clave = p.clave;
+
+    -- Empleados: no estan en Registro, sus datos siguen en la base local.
+    INSERT Catalogo.tblPersonas (nombrePersona, apellidosPersona, correoPersona, idGenero, idCampus, usuarioRegistro)
+    OUTPUT LEFT(inserted.correoPersona, CHARINDEX(N'.', inserted.correoPersona) - 1), inserted.idPersona INTO @p
+    VALUES (N'Diego', N'Director', N'diego.recorrido@ejemplo.invalid', 1, 1, ${u}),
+           (N'Ana',   N'Admin',    N'ana.recorrido@ejemplo.invalid',   2, 1, ${u});
 
     -- Estudiantes: perfil pregrado + rol ESTUDIANTE. Diego: docente, DIRECTOR. Ana: docente, ADMINISTRADOR_PROCAD.
     DECLARE @pregrado TINYINT = (SELECT idPerfil FROM Catalogo.tblPerfiles WHERE nombre = N'Estudiante de pregrado');
@@ -144,9 +176,9 @@ async function sembrarBase(): Promise<Base> {
         WHERE tg.nombreTipoGrupo = N'artistico' AND ta.estadoTipoActividad = 1
         ORDER BY ta.idTipoActividad FOR JSON PATH) AS tiposActividad,
       (SELECT TOP 1 idLugarVisoria FROM Procad.tblLugaresVisoria WHERE idCampus = 1 AND estadoLugar = 1 ORDER BY idLugarVisoria) AS lugar;
-  `);
+  `, Object.fromEntries(ESTUDIANTES.map((n) => [n, [sql.NVarChar(15), cuentas[n]] as const])));
   const tipos = JSON.parse(fila!.tiposActividad) as { id: number }[];
-  return { ...fila!, tiposActividad: tipos.map((t) => t.id) };
+  return { ...fila!, tiposActividad: tipos.map((t) => t.id), cuentas };
 }
 
 /** Grupo artistico creado directo en SQL, para las rondas cortas. */
@@ -230,7 +262,11 @@ async function rondaPrincipal(b: Base): Promise<void> {
 
   await paso("lista las 6 pendientes del grupo", "GET", `/solicitudes?grupo=${g}&estado=PENDIENTE`, undefined, 200,
     (c) => c.length === 6 || `${c.length} filas`);
-  await paso("busca por nombre", "GET", `/solicitudes?grupo=${g}&q=sofia`, undefined, 200, (c) => c.length === 1);
+  await paso("busca por numero de cuenta", "GET", `/solicitudes?grupo=${g}&q=${b.cuentas.sofia}`, undefined, 200,
+    (c) => (c.length === 1 && c[0].idSolicitud === s.sofia) || `${c.length} filas`);
+  await paso("el listado trae el nombre desde Registro", "GET", `/solicitudes?grupo=${g}`, undefined, 200,
+    (c) => c.every((f: any) => typeof f.nombrePersona === "string" && f.nombrePersona !== "")
+      || "hay filas sin nombre");
   await paso("el listado trae el periodo y la ficha", "GET", `/solicitudes?grupo=${g}`, undefined, 200,
     (c) => c[0].anioPeriodo === 2090 && Array.isArray(c[0].adjuntos));
 
@@ -307,7 +343,7 @@ async function rondaPrincipal(b: Base): Promise<void> {
     (c) => c.estudiantes.length === 1);
 
   await paso("matricula excepcional para Pedro, por numero de cuenta", "POST", "/matriculas-excepcionales",
-    { numeroCuenta: `2090${String(b.pedro).padStart(7, "0")}`, idPeriodo: b.p1, motivoExcepcion: "Apoyo en la organizacion del festival VOAE", idPersonaAutoriza: b.adm }, 201);
+    { numeroCuenta: b.cuentas.pedro, idPeriodo: b.p1, motivoExcepcion: "Apoyo en la organizacion del festival VOAE", idPersonaAutoriza: b.adm }, 201);
 
   // Expulsion con motivo Otro.
   const exp = await paso("el director pide expulsar a Maria (motivo Otro, con detalle)", "POST", "/expulsiones",
@@ -335,7 +371,7 @@ async function rondaPrincipal(b: Base): Promise<void> {
     await paso("Carla aparece POR_RECONFIRMAR en el periodo 2", "GET", `/condicionados?estado=POR_RECONFIRMAR&periodo=${b.p2}`,
       undefined, 200, (c) => (c.length === 1 && c[0].idPersonaAutorizaAnterior === b.adm) || `${c.length} filas`);
   } else {
-    console.log("  ·     (activar periodo se prueba en su ronda: el SP de Azure es el anterior)");
+    console.log("  ·     (activar periodo se prueba en su ronda, con el SP que hoy esta en la base)");
   }
 
   await paso("accesos del grupo", "GET", `/accesos?grupo=${g}`, undefined, 200, (c) => c.length === 1);
@@ -349,14 +385,14 @@ async function rondaPrincipal(b: Base): Promise<void> {
 /* ------------------------------ Principal ------------------------------- */
 
 async function principal(): Promise<void> {
-  console.log("Recorrido de voae-procad contra Azure. Todo corre en transacciones que se revierten.");
+  console.log("Recorrido de voae-procad contra la base real. Todo corre en transacciones que se revierten.");
   if (migraciones.length > 0) console.log(`Migraciones aplicadas dentro de cada ronda: ${migraciones.join(", ")}`);
   await conectar();
 
   await ronda("Ronda principal: el ciclo completo de PROCAD", rondaPrincipal);
 
   if (!migraciones.some((m) => /activar_nuevo_periodo/.test(m))) {
-    await ronda("Activar periodo con el SP que hoy esta en Azure", async (b) => {
+    await ronda("Activar periodo con el SP que hoy esta en la base", async (b) => {
       const g = await crearGrupoSql(b);
       const s = await sembrarGrupo(b, g);
       await paso("aprueba a Juan", "POST", `/solicitudes/${s.juan}/resolucion`, { decision: "APROBADO", idPersona: b.dir }, 200);
@@ -403,7 +439,8 @@ async function principal(): Promise<void> {
   // Nada debe haber quedado escrito.
   await iniciarRonda();
   const restos = await consultarUna<Record<string, number>>(`
-    SELECT (SELECT COUNT(*) FROM Catalogo.tblPersonas WHERE correoPersona LIKE N'%.recorrido@ejemplo.invalid') AS personas,
+    SELECT (SELECT COUNT(*) FROM Catalogo.tblPersonas WHERE usuarioRegistro = N'${MARCA}') AS personas,
+           (SELECT COUNT(*) FROM Catalogo.tblDetallesEstudiantes WHERE usuarioRegistro = N'${MARCA}') AS estudiantes,
            (SELECT COUNT(*) FROM Catalogo.tblPeriodos WHERE anioPeriodo = 2090) AS periodos,
            (SELECT COUNT(*) FROM Procad.tblGrupos WHERE nombreGrupo LIKE N'Coro Recorrido%') AS grupos,
            (SELECT COUNT(*) FROM Procad.tblSolicitudes WHERE usuarioRegistro = N'${MARCA}') AS solicitudes`);
