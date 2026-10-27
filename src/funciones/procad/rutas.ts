@@ -31,6 +31,7 @@ import {
 } from "../../compartido/validacion";
 import * as actividades from "./actividades";
 import * as catalogos from "./catalogos";
+import * as estudiantes from "./estudiantes";
 import {
   decisionDe,
   estadoOpcional,
@@ -91,7 +92,46 @@ router.get("/solicitudes", async ({ consulta }) =>
   }),
 );
 
+/** Niveles que acepta chkDetalleSolicitud_Nivel. */
+const NIVELES_EXPERIENCIA = ["Principiante", "Intermedio", "Avanzado"] as const;
+
+/** El formulario del estudiante, igual en el envio y en la correccion. */
+function leerFormulario(cuerpo: Record<string, unknown>): solicitudes.FormularioSolicitud & { numeroCuenta: string } {
+  if (booleanoOpcional(cuerpo["aceptoReglamento"], "aceptoReglamento") !== true) {
+    throw solicitudInvalida("Para enviar la solicitud hay que aceptar el reglamento (aceptoReglamento: true).");
+  }
+  const nivel = textoOpcional(cuerpo["nivelExperiencia"], "nivelExperiencia", 20);
+  const nivelValido = nivel === null ? null : NIVELES_EXPERIENCIA.find((n) => n.toLowerCase() === nivel.toLowerCase());
+  if (nivel !== null && !nivelValido) {
+    throw solicitudInvalida(`nivelExperiencia debe ser uno de: ${NIVELES_EXPERIENCIA.join(", ")}.`);
+  }
+  return {
+    numeroCuenta: textoRequerido(cuerpo["numeroCuenta"], "numeroCuenta", 15),
+    contactoEmergenciaNombre: textoRequerido(cuerpo["contactoEmergenciaNombre"], "contactoEmergenciaNombre", 150),
+    contactoEmergenciaTelefono: textoRequerido(cuerpo["contactoEmergenciaTelefono"], "contactoEmergenciaTelefono", 30),
+    idPosicion: enteroOpcional(cuerpo["idPosicion"], "idPosicion"),
+    idInstrumento: enteroOpcional(cuerpo["idInstrumento"], "idInstrumento"),
+    nivelExperiencia: nivelValido ?? null,
+    alergia: textoOpcional(cuerpo["alergia"], "alergia", 300),
+    experiencia: textoOpcional(cuerpo["experiencia"], "experiencia", 4000),
+  };
+}
+
+/** El estudiante envia su solicitud de ingreso (Procad.spCrearSolicitud). */
+router.post("/solicitudes", async ({ cuerpo, usuarioRegistro }) =>
+  creado(await solicitudes.crearSolicitud({
+    ...leerFormulario(cuerpo),
+    idGrupo: enteroRequerido(cuerpo["idGrupo"], "idGrupo"),
+    idPeriodo: enteroRequerido(cuerpo["idPeriodo"], "idPeriodo"),
+  }, usuarioRegistro)),
+);
+
 router.get("/solicitudes/{id}", async (peticion) => solicitudes.obtenerSolicitud(idDeRuta(peticion)));
+
+/** El estudiante corrige una solicitud OBSERVADO y la reenvia: vuelve a PENDIENTE. */
+router.put("/solicitudes/{id}/correccion", async (peticion) =>
+  solicitudes.corregirSolicitud(idDeRuta(peticion), leerFormulario(peticion.cuerpo), peticion.usuarioRegistro),
+);
 
 router.get("/solicitudes/{id}/foto", async (peticion) => solicitudes.obtenerFotoDeSolicitud(idDeRuta(peticion)));
 
@@ -113,6 +153,13 @@ router.put("/solicitudes/{id}/equipo", async (peticion) => {
   if (esEquipo === null) throw solicitudInvalida("El campo esEquipo es obligatorio: true o false.");
   return solicitudes.marcarEquipo(idDeRuta(peticion), esEquipo);
 });
+
+/* ------------------------------ Estudiantes ------------------------------ */
+
+/** Lo que el estudiante ve de si mismo: Registro, indice minimo y sus solicitudes. */
+router.get("/estudiantes/{cuenta}", async ({ parametros }) =>
+  estudiantes.obtenerEstudiante(textoRequerido(parametros["cuenta"], "cuenta", 15)),
+);
 
 /* ----------------------------- Condicionados ----------------------------- */
 
@@ -500,12 +547,22 @@ router.put("/usuarios/{id}", async (peticion) => {
 
 router.get("/salud", async () => {
   const inicio = Date.now();
-  const fila = await consultarUna<{ ahora: Date }>("SELECT SYSDATETIME() AS ahora");
+  // Lo dice la propia base, no la configuracion: asi se ve si se llego a la de
+  // la universidad (10.8.x.x) o a Azure. En Azure la IP puede venir NULL.
+  const fila = await consultarUna<{ ahora: Date; ipServidor: string | null; servidor: string | null; base: string | null }>(
+    `SELECT SYSDATETIME() AS ahora,
+            CAST(CONNECTIONPROPERTY('local_net_address') AS VARCHAR(48)) AS ipServidor,
+            @@SERVERNAME AS servidor,
+            DB_NAME() AS base`,
+  );
   return {
     funcion: "voae-procad",
     ok: fila !== null,
     msConsulta: Date.now() - inicio,
     ahoraEnBase: fila?.ahora ?? null,
+    ipServidor: fila?.ipServidor ?? null,
+    servidor: fila?.servidor ?? null,
+    base: fila?.base ?? null,
     // Si esta invocacion estreno el contenedor, el tiempo incluye conexion
     // TDS a Azure y lectura del secreto; si no, es solo el round trip.
     contenedorFrio: contenedorFrio(),

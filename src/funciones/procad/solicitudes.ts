@@ -23,6 +23,7 @@ import { consultar, consultarUna, ejecutarProcedimiento, enTransaccion, sql, typ
 import { conflicto, noEncontrado, solicitudInvalida } from "../../compartido/errores";
 import { Filtros, CONTEXTO, idEstado, usuarioParam, type Ejecutor } from "./entrada";
 import { academicos, coincide, conDatosDeRegistro } from "./registro";
+import { cumpleIndiceMinimo, registroDe } from "./estudiantes";
 
 export const ESTADOS_SOLICITUD = [
   "PENDIENTE", "APROBADO", "NO_CUMPLE_REQUISITO", "OBSERVADO", "EXPULSADO",
@@ -150,6 +151,141 @@ export async function obtenerSolicitud(idSolicitud: number) {
   ]);
 
   return { ...solicitud, detalle, adjuntos, historial };
+}
+
+/** Lo que el estudiante llena en su formulario (tblDetallesSolicitudes + la experiencia como texto). */
+export interface FormularioSolicitud {
+  contactoEmergenciaNombre: string;
+  contactoEmergenciaTelefono: string;
+  idPosicion: number | null;
+  idInstrumento: number | null;
+  nivelExperiencia: string | null;
+  alergia: string | null;
+  /** Experiencia escrita: va como adjunto de tipo texto, que es lo que el panel ya lee. */
+  experiencia: string | null;
+}
+
+/**
+ * El estudiante pide entrar a un grupo. Lo hace Procad.spCrearSolicitud:
+ * valida en Registro la cuenta, el campus y la categoria de sexo, crea a la
+ * persona si es su primera vez, y escribe solicitud, detalle y log. Se llama
+ * sin transaccion propia porque lee el linked server (ver cabecera).
+ *
+ * cumpleIndiceMinimo no lo manda el navegador: se calcula aqui con el indice
+ * del periodo que da Registro, para que nadie pueda declararlo por su cuenta.
+ */
+export async function crearSolicitud(
+  datos: FormularioSolicitud & { numeroCuenta: string; idGrupo: number; idPeriodo: number },
+  usuario: string,
+) {
+  const registro = await registroDe(datos.numeroCuenta);
+
+  const creada = await consultarUna<{ idSolicitud: number | null }>(`
+    DECLARE @id INT;
+    EXEC Procad.spCrearSolicitud
+         @numeroCuenta = @cuenta, @idGrupo = @grupo, @idPeriodo = @periodo,
+         @cumpleIndiceMinimo = @cumple,
+         @contactoEmergenciaNombre = @contactoNombre, @contactoEmergenciaTelefono = @contactoTelefono,
+         @aceptoReglamento = 1,
+         @idPosicion = @posicion, @alergia = @alergia, @idInstrumento = @instrumento,
+         @nivelExperiencia = @nivel,
+         @usuarioRegistro = @usuario, @idSolicitud = @id OUTPUT;
+    SELECT @id AS idSolicitud;
+  `, {
+    cuenta: [sql.NVarChar(15), datos.numeroCuenta],
+    grupo: [sql.Int, datos.idGrupo],
+    periodo: [sql.Int, datos.idPeriodo],
+    cumple: [sql.Bit, cumpleIndiceMinimo(registro)],
+    contactoNombre: [sql.NVarChar(150), datos.contactoEmergenciaNombre],
+    contactoTelefono: [sql.NVarChar(30), datos.contactoEmergenciaTelefono],
+    posicion: [sql.Int, datos.idPosicion],
+    alergia: [sql.NVarChar(300), datos.alergia],
+    instrumento: [sql.Int, datos.idInstrumento],
+    nivel: [sql.NVarChar(20), datos.nivelExperiencia],
+    usuario: usuarioParam(usuario),
+  });
+  const idSolicitud = creada?.idSolicitud;
+  if (!idSolicitud) throw conflicto("La base no devolvio la solicitud creada.");
+
+  if (datos.experiencia) {
+    await consultar(`
+      INSERT INTO Procad.tblAdjuntosSolicitudes (idSolicitud, tipoAdjunto, contenidoTexto, usuarioRegistro)
+      VALUES (@id, N'texto', @texto, @usuario)
+    `, { id: [sql.Int, idSolicitud], texto: [sql.NVarChar(sql.MAX), datos.experiencia], usuario: usuarioParam(usuario) });
+  }
+
+  return obtenerSolicitud(idSolicitud);
+}
+
+/**
+ * Corregir y reenviar: solo una solicitud OBSERVADO, y solo su dueno. Se
+ * reemplaza el formulario, la experiencia escrita y vuelve a PENDIENTE para
+ * que el director la revise otra vez. El indice se recalcula: pudo cambiar.
+ */
+export async function corregirSolicitud(
+  idSolicitud: number,
+  datos: FormularioSolicitud & { numeroCuenta: string },
+  usuario: string,
+) {
+  const registro = await registroDe(datos.numeroCuenta);
+
+  await enTransaccion(async (ejecutar) => {
+    const actual = await bloquearSolicitud(ejecutar, idSolicitud);
+    const [duena] = await ejecutar<{ idPersona: number }>(`
+      SELECT s.idPersona
+        FROM Procad.tblSolicitudes s
+       INNER JOIN Catalogo.tblDetallesEstudiantes de ON de.idPersona = s.idPersona
+       WHERE s.idSolicitud = @id AND de.numeroCuenta = @cuenta
+    `, { id: [sql.Int, idSolicitud], cuenta: [sql.NVarChar(15), datos.numeroCuenta] });
+    if (!duena) throw noEncontrado(`La solicitud ${idSolicitud} no es de la cuenta ${datos.numeroCuenta}.`);
+    if (actual.codigoEstado !== "OBSERVADO") {
+      throw conflicto(
+        `La solicitud ${idSolicitud} esta en estado ${actual.codigoEstado}: solo se corrige una solicitud OBSERVADO.`,
+      );
+    }
+
+    const parametros: Record<string, Parametro> = {
+      id: [sql.Int, idSolicitud],
+      contactoNombre: [sql.NVarChar(150), datos.contactoEmergenciaNombre],
+      contactoTelefono: [sql.NVarChar(30), datos.contactoEmergenciaTelefono],
+      posicion: [sql.Int, datos.idPosicion],
+      alergia: [sql.NVarChar(300), datos.alergia],
+      instrumento: [sql.Int, datos.idInstrumento],
+      nivel: [sql.NVarChar(20), datos.nivelExperiencia],
+      cumple: [sql.Bit, cumpleIndiceMinimo(registro)],
+      texto: [sql.NVarChar(sql.MAX), datos.experiencia],
+      pendiente: [sql.NVarChar(40), "PENDIENTE"],
+      usuario: usuarioParam(usuario),
+    };
+
+    await ejecutar(`
+      UPDATE Procad.tblDetallesSolicitudes
+         SET contactoEmergenciaNombre = @contactoNombre, contactoEmergenciaTelefono = @contactoTelefono,
+             idPosicion = @posicion, alergia = @alergia, idInstrumento = @instrumento, nivelExperiencia = @nivel
+       WHERE idSolicitud = @id;
+
+      DELETE FROM Procad.tblAdjuntosSolicitudes WHERE idSolicitud = @id AND tipoAdjunto = N'texto';
+      IF @texto IS NOT NULL
+        INSERT INTO Procad.tblAdjuntosSolicitudes (idSolicitud, tipoAdjunto, contenidoTexto, usuarioRegistro)
+        VALUES (@id, N'texto', @texto, @usuario);
+
+      UPDATE Procad.tblSolicitudes
+         SET idEstado = ${idEstado(CONTEXTO.solicitud, "pendiente")},
+             cumpleIndiceMinimo = @cumple,
+             fechaActualizacion = SYSDATETIME()
+       WHERE idSolicitud = @id;
+    `, parametros);
+
+    await registrarCambioDeEstado(ejecutar, {
+      idSolicitud,
+      idPersona: duena.idPersona,
+      idEstadoAnterior: actual.idEstado,
+      observacion: "Solicitud corregida y reenviada por el estudiante",
+      usuario,
+    });
+  });
+
+  return obtenerSolicitud(idSolicitud);
 }
 
 /**
